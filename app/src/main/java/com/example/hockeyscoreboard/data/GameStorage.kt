@@ -174,6 +174,8 @@ fun buildTopScorersRows(stats: Map<String, PlayerStats>): List<PlayerStatsRow> {
     }
 }
 
+
+
 // Построение таблицы "Лучшие бомбардиры"
 fun buildTopBombersRows(stats: Map<String, PlayerStats>): List<PlayerStatsRow> {
     val list = stats.entries
