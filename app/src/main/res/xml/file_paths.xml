@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!-- Соответствует каталогу getExternalFilesDir(null)/HockeyScoreboard -->
+    <external-files-path
+        name="hockey_games"
+        path="HockeyScoreboard/" />
+
+</paths>
