@@ -1,6 +1,5 @@
 package com.example.hockeyscoreboard.model
 
-
 import androidx.compose.runtime.saveable.Saver
 
 // Амплуа игрока
@@ -29,7 +28,8 @@ data class GoalEvent(
     val team: Team,
     val scorer: String,
     val assist1: String?,
-    val assist2: String?
+    val assist2: String?,
+    val eventOrder: Long = 0L      // общий порядок события в матче
 )
 
 // Сводная статистика игрока по всем сохранённым играм
@@ -62,19 +62,62 @@ val GoalEventListSaver: Saver<List<GoalEvent>, List<String>> =
                     goal.team.name,
                     goal.scorer,
                     goal.assist1 ?: "",
-                    goal.assist2 ?: ""
+                    goal.assist2 ?: "",
+                    goal.eventOrder.toString()
                 ).joinToString("§")
             }
         },
         restore = { saved ->
-            saved.map { line ->
+            saved.mapIndexed { index, line ->
                 val parts = line.split("§")
+                val eventOrder = parts.getOrNull(5)?.toLongOrNull() ?: index.toLong()
+
                 GoalEvent(
                     id = parts[0].toLong(),
                     team = Team.valueOf(parts[1]),
                     scorer = parts[2],
-                    assist1 = parts[3].ifEmpty { null },
-                    assist2 = parts[4].ifEmpty { null }
+                    assist1 = parts.getOrNull(3)?.ifEmpty { null },
+                    assist2 = parts.getOrNull(4)?.ifEmpty { null },
+                    eventOrder = eventOrder
+                )
+            }
+        }
+    )
+
+// Изменение состава по ходу матча
+data class RosterChangeEvent(
+    val id: Long,
+    val player: String,
+    val fromTeam: Team?,   // null = был вне команд
+    val toTeam: Team?,     // null = стал вне команд
+    val eventOrder: Long = 0L   // общий порядок события в матче
+)
+
+// Saver для списка изменений составов
+val RosterChangeEventListSaver: Saver<List<RosterChangeEvent>, List<String>> =
+    Saver(
+        save = { list ->
+            list.map { ev ->
+                listOf(
+                    ev.id.toString(),
+                    ev.player,
+                    ev.fromTeam?.name ?: "",
+                    ev.toTeam?.name ?: "",
+                    ev.eventOrder.toString()
+                ).joinToString("§")
+            }
+        },
+        restore = { saved ->
+            saved.mapIndexed { index, line ->
+                val parts = line.split("§")
+                val eventOrder = parts.getOrNull(4)?.toLongOrNull() ?: index.toLong()
+
+                RosterChangeEvent(
+                    id = parts[0].toLong(),
+                    player = parts[1],
+                    fromTeam = parts[2].ifEmpty { null }?.let { Team.valueOf(it) },
+                    toTeam = parts[3].ifEmpty { null }?.let { Team.valueOf(it) },
+                    eventOrder = eventOrder
                 )
             }
         }

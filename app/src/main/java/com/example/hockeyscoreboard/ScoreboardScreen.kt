@@ -6,9 +6,9 @@ import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
@@ -30,17 +30,14 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.FileProvider
 import com.example.hockeyscoreboard.data.*
+import com.example.hockeyscoreboard.data.db.GameDatabase
+import com.example.hockeyscoreboard.data.db.GameEntry
 import com.example.hockeyscoreboard.model.*
 import com.example.hockeyscoreboard.ui.theme.HockeyScoreboardTheme
-import org.json.JSONArray
-import org.json.JSONObject
 import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import com.example.hockeyscoreboard.data.db.GameDatabase
-import com.example.hockeyscoreboard.data.db.GameEntry
-
 
 // --- Цвета для всплывающих окон в общем стиле ---
 
@@ -62,21 +59,23 @@ private fun dialogDangerButtonColors() = ButtonDefaults.textButtonColors(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ScoreboardScreen(
-    gameRepository: GameRepository,
     driveAccountEmail: String? = null,
     onConnectDrive: () -> Unit = {},
     onGameSaved: (File) -> Unit = {},
     onGameJsonUpdated: (File) -> Unit = {},
-    onNewGameStarted: () -> Unit = {}          // <- НОВЫЙ параметр
+    onNewGameStarted: () -> Unit = {},
+    onGameDeleted: (gameId: String, file: File?) -> Unit = { _, _ -> }
+
+
 ) {
     val context = LocalContext.current
     val prefs = remember {
         context.getSharedPreferences("hockey_prefs", Context.MODE_PRIVATE)
     }
+
     // --- Локальная БД для индекса игр ---
     val gameDb = remember { GameDatabase.getInstance(context) }
     val gameDao = remember { gameDb.gameDao() }
-
 
     // --- БАЗОВЫЙ СПИСОК ИГРОКОВ (имена + роль + рейтинг) ---
 
@@ -110,7 +109,6 @@ fun ScoreboardScreen(
 
     var showBasePlayersDialog by remember { mutableStateOf(false) }
     var showLineupsDialog by remember { mutableStateOf(false) }
-    var showTransferDialog by remember { mutableStateOf(false) }
     var showHistoryDialog by remember { mutableStateOf(false) }
     var showHistoryDetailsDialog by remember { mutableStateOf(false) }
     var showFinishConfirm by remember { mutableStateOf(false) }
@@ -124,23 +122,41 @@ fun ScoreboardScreen(
     var topScorersRows by remember { mutableStateOf<List<PlayerStatsRow>>(emptyList()) }
     var topBombersRows by remember { mutableStateOf<List<PlayerStatsRow>>(emptyList()) }
 
-    // текущая выбранная игра (файл) для просмотра протокола
+    // текущая выбранная игра (из БД) и её файл
     var historySelectedEntry by remember { mutableStateOf<GameEntry?>(null) }
     var historySelectedFile by remember { mutableStateOf<File?>(null) }
     var historyDetailsText by remember { mutableStateOf("") }
 
     // подтверждение удаления сохранённой игры
     var showDeleteGameConfirm by remember { mutableStateOf(false) }
-    // --- ИГРА / ГОЛЫ ---
+
+    // --- ИГРА / ГОЛЫ / ПРОТОКОЛ ---
 
     var goals by rememberSaveable(stateSaver = GoalEventListSaver) {
         mutableStateOf(listOf<GoalEvent>())
     }
+
+    // Протокол изменений составов по ходу матча
+    var rosterChanges by rememberSaveable(stateSaver = RosterChangeEventListSaver) {
+        mutableStateOf(listOf<RosterChangeEvent>())
+    }
+
+    var nextGoalId by rememberSaveable { mutableStateOf(1L) }
+    var nextRosterChangeId by rememberSaveable { mutableStateOf(1L) }
+
+    // Общий счётчик порядка событий (голы + изменения составов)
+    var nextEventOrder by rememberSaveable { mutableStateOf(1L) }
     // Время старта текущей игры (для стабильного gameId / имени файла)
     var gameStartMillis by rememberSaveable { mutableStateOf<Long?>(null) }
 
     val redScore = goals.count { it.team == Team.RED }
     val whiteScore = goals.count { it.team == Team.WHITE }
+    // Снапшоты составов на момент открытия диалога "Составы команд"
+    var lastLineupsRedSnapshot by remember { mutableStateOf<List<String>>(emptyList()) }
+    var lastLineupsWhiteSnapshot by remember { mutableStateOf<List<String>>(emptyList()) }
+    // Базовые составы зафиксированы (первое сохранение — только база, без событий)
+    var hasBaselineLineups by rememberSaveable { mutableStateOf(false) }
+
 
     var goalInputTeam by remember { mutableStateOf<Team?>(null) }
     var editingGoalId by remember { mutableStateOf<Long?>(null) }
@@ -148,13 +164,9 @@ fun ScoreboardScreen(
     var tempAssist1 by remember { mutableStateOf<String?>(null) }
     var tempAssist2 by remember { mutableStateOf<String?>(null) }
 
-    var nextGoalId by rememberSaveable { mutableStateOf(1L) }
-
     var goalOptionsFor by remember { mutableStateOf<GoalEvent?>(null) }
 
     var gameFinished by rememberSaveable { mutableStateOf(false) }
-
-    val scrollState = rememberScrollState()
 
     // --- УТИЛИТЫ ---
 
@@ -168,11 +180,79 @@ fun ScoreboardScreen(
 
     fun resetGameState() {
         goals = emptyList()
+        rosterChanges = emptyList()
         nextGoalId = 1L
+        nextRosterChangeId = 1L
+        nextEventOrder = 1L
         gameFinished = false
-        gameStartMillis = null       // новая игра → будет новый id
+        gameStartMillis = null
+
+        lastLineupsRedSnapshot = emptyList()
+        lastLineupsWhiteSnapshot = emptyList()
+        hasBaselineLineups = false
+
         resetGoalInput()
         goalOptionsFor = null
+    }
+
+
+    fun logRosterChangesFromDialog() {
+        // Первый вызов: просто фиксируем базовый состав, но НЕ создаём событий
+        if (!hasBaselineLineups) {
+            lastLineupsRedSnapshot = playersRed
+            lastLineupsWhiteSnapshot = playersWhite
+            hasBaselineLineups = true
+            return
+        }
+
+        // Все известные игроки
+        val baseNames = basePlayers.map { it.name }.toSet()
+
+        // Состояние "до" (на момент открытия диалога)
+        val beforeRed = lastLineupsRedSnapshot.toSet()
+        val beforeWhite = lastLineupsWhiteSnapshot.toSet()
+        val beforeNone = baseNames - beforeRed - beforeWhite
+
+        // Состояние "после" (на момент нажатия OK)
+        val afterRed = playersRed.toSet()
+        val afterWhite = playersWhite.toSet()
+        val afterNone = baseNames - afterRed - afterWhite
+
+        val allNames = (beforeRed + beforeWhite + beforeNone +
+                afterRed + afterWhite + afterNone).toSet()
+
+        val newEvents = mutableListOf<RosterChangeEvent>()
+
+        for (name in allNames) {
+            val fromTeam = when {
+                name in beforeRed -> Team.RED
+                name in beforeWhite -> Team.WHITE
+                else -> null
+            }
+            val toTeam = when {
+                name in afterRed -> Team.RED
+                name in afterWhite -> Team.WHITE
+                else -> null
+            }
+
+            if (fromTeam != toTeam) {
+                newEvents += RosterChangeEvent(
+                    id = nextRosterChangeId++,
+                    player = name,
+                    fromTeam = fromTeam,
+                    toTeam = toTeam,
+                    eventOrder = nextEventOrder++
+                )
+            }
+        }
+
+        if (newEvents.isNotEmpty()) {
+            rosterChanges = rosterChanges + newEvents
+        }
+
+        // Обновляем снапшоты на текущее состояние
+        lastLineupsRedSnapshot = playersRed
+        lastLineupsWhiteSnapshot = playersWhite
     }
 
     fun startNewGoal(team: Team) {
@@ -214,26 +294,25 @@ fun ScoreboardScreen(
         val fileName = fileFormat.format(startDate) + "_pestovo.json"
         val dateIso = isoFormat.format(startDate)
 
-        val root = JSONObject()
+        val root = org.json.JSONObject()
 
         root.put("gameId", fileFormat.format(startDate) + "_pestovo")
         root.put("arena", "Пестово Арена")
         root.put("date", dateIso)
         root.put("finished", isFinal)   // флаг завершения игры
 
-        // --- Команды и составы ---
-        val teamsObj = JSONObject()
-        val redObj = JSONObject()
-        val whiteObj = JSONObject()
+        val teamsObj = org.json.JSONObject()
+        val redObj = org.json.JSONObject()
+        val whiteObj = org.json.JSONObject()
 
         redObj.put("name", "Красные")
         whiteObj.put("name", "Белые")
 
-        val redPlayersArray = JSONArray()
+        val redPlayersArray = org.json.JSONArray()
         playersRed.forEach { redPlayersArray.put(it) }
         redObj.put("players", redPlayersArray)
 
-        val whitePlayersArray = JSONArray()
+        val whitePlayersArray = org.json.JSONArray()
         playersWhite.forEach { whitePlayersArray.put(it) }
         whiteObj.put("players", whitePlayersArray)
 
@@ -242,53 +321,73 @@ fun ScoreboardScreen(
 
         root.put("teams", teamsObj)
 
-        // --- Итоговый счёт на момент сохранения ---
+        // Текущий счёт считаем по списку голов на момент вызова
         val currentRedScore = goals.count { it.team == Team.RED }
         val currentWhiteScore = goals.count { it.team == Team.WHITE }
 
-        val scoreObj = JSONObject()
+        val scoreObj = org.json.JSONObject()
         scoreObj.put("RED", currentRedScore)
         scoreObj.put("WHITE", currentWhiteScore)
         root.put("finalScore", scoreObj)
 
-        // --- Список голов по ходу матча ---
-        val goalsArray = JSONArray()
+        val goalsArray = org.json.JSONArray()
         var runningRed = 0
         var runningWhite = 0
 
-        goals.forEachIndexed { index, goal ->
+        goals.sortedBy { it.eventOrder }.forEachIndexed { index, goal ->
             if (goal.team == Team.RED) runningRed++ else runningWhite++
-
-            val goalObj = JSONObject()
-            goalObj.put("index", index + 1)
+            val goalObj = org.json.JSONObject()
             goalObj.put("team", goal.team.name)
             goalObj.put("scoreAfter", "${runningRed}:${runningWhite}")
             goalObj.put("scorer", goal.scorer)
             goalObj.put("assist1", goal.assist1)
             goalObj.put("assist2", goal.assist2)
-
+            goalObj.put("order", goal.eventOrder)
             goalsArray.put(goalObj)
         }
 
-        // ВАЖНО: раньше этой строки не было — из-за этого в JSON не было голов
         root.put("goals", goalsArray)
+
+        // Изменения составов по ходу матча
+        val rosterArray = org.json.JSONArray()
+        rosterChanges.sortedBy { it.eventOrder }.forEachIndexed { index, ev ->
+            val evObj = org.json.JSONObject()
+            evObj.put("id", ev.id)
+            evObj.put("player", ev.player)
+            evObj.put("fromTeam", ev.fromTeam?.name)
+            evObj.put("toTeam", ev.toTeam?.name)
+            evObj.put("order", ev.eventOrder)
+            rosterArray.put(evObj)
+        }
+        root.put("rosterChanges", rosterArray)
+
+
+        return fileName to root.toString(2)
+
 
         return fileName to root.toString(2)
     }
 
-
-
     /**
-     * Реально сохраняем JSON в файл в каталоге games (через GameRepository) и возвращаем File.
+     * Реально сохраняем JSON в файл и возвращаем File.
      * Тот же файл используем и для Drive, и для локальной истории.
      */
     fun saveGameJsonToFile(isFinal: Boolean = false): File {
         val (fileName, json) = buildGameJson(isFinal)
-        return gameRepository.saveGameJson(fileName, json)
+
+        val dir = getGamesDir(context)
+        if (!dir.exists()) dir.mkdirs()
+
+        val file = File(dir, fileName)
+        file.writeText(json, Charsets.UTF_8)
+        return file
     }
 
     /**
-     * Автообновление JSON при любом изменении голов.
+     * Общая точка: любое обновление игры.
+     * 1) сохраняем JSON,
+     * 2) обновляем запись в Room,
+     * 3) отправляем наружу на Drive.
      */
     fun notifyGameJsonUpdated(isFinal: Boolean = false) {
         // 1. сохраняем JSON на диск
@@ -313,26 +412,31 @@ fun ScoreboardScreen(
 
         // 3. уведомляем наружу – что делать с этим файлом
         if (isFinal) {
-            // финальный файл → MainActivity отправит его в архив на Drive
             onGameSaved(file)
         } else {
-            // обычное обновление по ходу игры
             onGameJsonUpdated(file)
         }
     }
-
 
     fun commitGoalIfPossible() {
         if (gameFinished) return
         val team = goalInputTeam ?: return
         val scorer = tempScorer ?: return
 
+        // id гола
+        val id = editingGoalId ?: nextGoalId++
+
+        // если редактируем, сохраняем старый order, иначе выдаём новый
+        val existingOrder = goals.find { it.id == id }?.eventOrder
+        val order = existingOrder ?: nextEventOrder++
+
         val newEvent = GoalEvent(
-            id = editingGoalId ?: nextGoalId++,
+            id = id,
             team = team,
             scorer = scorer,
             assist1 = tempAssist1,
-            assist2 = tempAssist2
+            assist2 = tempAssist2,
+            eventOrder = order
         )
 
         goals = if (editingGoalId == null) {
@@ -422,7 +526,6 @@ fun ScoreboardScreen(
                     )
                 },
                 actions = {
-                    // Индикация статуса Google Drive
                     Icon(
                         imageVector = if (driveAccountEmail != null)
                             Icons.Filled.Share
@@ -433,14 +536,13 @@ fun ScoreboardScreen(
                         else
                             "Google Drive не подключён",
                         tint = if (driveAccountEmail != null)
-                            Color(0xFF81C784)   // зелёный, подключено
+                            Color(0xFF81C784)
                         else
-                            Color(0xFFB0BEC5),  // серый, не подключено
+                            Color(0xFFB0BEC5),
                         modifier = Modifier
                             .padding(end = 8.dp)
                             .size(24.dp)
                     )
-
                 },
                 colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
                     containerColor = Color(0xFF10202B),
@@ -462,120 +564,17 @@ fun ScoreboardScreen(
         floatingActionButtonPosition = FabPosition.End,
         containerColor = Color(0xFF071422)
     ) { innerPadding ->
-        Column(
+        ScoreboardContentView(
+            redScore = redScore,
+            whiteScore = whiteScore,
+            goals = goals,
+            gameFinished = gameFinished,
+            onTeamClick = { team -> startNewGoal(team) },
+            onGoalClick = { goal -> goalOptionsFor = goal },
             modifier = Modifier
                 .fillMaxSize()
                 .padding(innerPadding)
-                .verticalScroll(scrollState)
-                .padding(16.dp),
-            verticalArrangement = Arrangement.Top,
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-
-            // Верхнее табло – две карточки со счётом
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceEvenly,
-                verticalAlignment = Alignment.Top
-            ) {
-
-                TeamScoreCard(
-                    teamName = "Красные",
-                    score = redScore,
-                    backgroundColor = Color(0xFFB71C1C),
-                    textColor = Color(0xFFFFF8E1),
-                    modifier = Modifier.weight(1f),
-                    onClick = { startNewGoal(Team.RED) }
-                )
-
-                Spacer(modifier = Modifier.width(16.dp))
-
-                TeamScoreCard(
-                    teamName = "Белые",
-                    score = whiteScore,
-                    backgroundColor = Color(0xFFCFD8DC),
-                    textColor = Color(0xFF263238),
-                    modifier = Modifier.weight(1f),
-                    onClick = { startNewGoal(Team.WHITE) }
-                )
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Text(
-                text = if (!gameFinished)
-                    "Нажмите на счёт, чтобы добавить/изменить гол"
-                else
-                    "Игра завершена. Редактирование отключено.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = Color(0xFFB0BEC5)
-            )
-
-            Spacer(modifier = Modifier.height(24.dp))
-
-            // Список всех голов по ходу матча
-            if (goals.isNotEmpty()) {
-                Text(
-                    text = "Голы по ходу матча",
-                    fontSize = 18.sp,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color(0xFFECEFF1),
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(bottom = 8.dp)
-                )
-
-                var runningRed = 0
-                var runningWhite = 0
-
-                goals.forEach { goal ->
-                    if (goal.team == Team.RED) runningRed++ else runningWhite++
-                    val scoreText = "$runningRed:$runningWhite"
-                    val teamName = if (goal.team == Team.RED) "Красные" else "Белые"
-                    val teamColor = if (goal.team == Team.RED) {
-                        Color(0xFFFFCDD2)
-                    } else {
-                        Color(0xFFCFD8DC)
-                    }
-
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(vertical = 2.dp)
-                            .clickable(
-                                enabled = !gameFinished
-                            ) { goalOptionsFor = goal }
-                    ) {
-                        Row(
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                text = scoreText,
-                                fontSize = 18.sp,
-                                fontWeight = FontWeight.Bold,
-                                color = Color(0xFFECEFF1),
-                                modifier = Modifier.widthIn(min = 52.dp)
-                            )
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text(
-                                text = teamName,
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = teamColor
-                            )
-                        }
-                        Spacer(modifier = Modifier.height(2.dp))
-                        Text(
-                            text = formatGoal(goal),
-                            fontSize = 14.sp,
-                            color = Color(0xFF81D4FA)
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.height(64.dp))
-        }
+        )
     }
 
     // --- Дальше все диалоги ---
@@ -617,7 +616,12 @@ fun ScoreboardScreen(
                     TextButton(
                         onClick = {
                             showActionsMenu = false
-                            if (!gameFinished) showLineupsDialog = true
+                            if (!gameFinished) {
+                                // запоминаем составы перед редактированием
+                                lastLineupsRedSnapshot = playersRed
+                                lastLineupsWhiteSnapshot = playersWhite
+                                showLineupsDialog = true
+                            }
                         },
                         enabled = !gameFinished,
                         colors = dialogButtonColors()
@@ -625,21 +629,12 @@ fun ScoreboardScreen(
                         Text("Составы команд", fontSize = 16.sp)
                     }
 
-                    TextButton(
-                        onClick = {
-                            showActionsMenu = false
-                            if (!gameFinished) showTransferDialog = true
-                        },
-                        enabled = !gameFinished,
-                        colors = dialogButtonColors()
-                    ) {
-                        Text("Перенос игроков", fontSize = 16.sp)
-                    }
 
                     TextButton(
                         onClick = {
                             showActionsMenu = false
                             historyDetailsText = ""
+                            historySelectedEntry = null
                             historySelectedFile = null
                             showHistoryDetailsDialog = false
                             showHistoryDialog = true
@@ -652,8 +647,8 @@ fun ScoreboardScreen(
                     TextButton(
                         onClick = {
                             showActionsMenu = false
-                            val stats = gameRepository.collectPlayerStats()
-                            topScorersRows = gameRepository.buildTopScorersRows(stats)
+                            val stats = collectPlayerStats(context)
+                            topScorersRows = buildTopScorersRows(stats)
                             showTopScorersDialog = true
                         },
                         colors = dialogButtonColors()
@@ -664,8 +659,8 @@ fun ScoreboardScreen(
                     TextButton(
                         onClick = {
                             showActionsMenu = false
-                            val stats = gameRepository.collectPlayerStats()
-                            topBombersRows = gameRepository.buildTopBombersRows(stats)
+                            val stats = collectPlayerStats(context)
+                            topBombersRows = buildTopBombersRows(stats)
                             showTopBombersDialog = true
                         },
                         colors = dialogButtonColors()
@@ -695,6 +690,7 @@ fun ScoreboardScreen(
                     ) {
                         Text("Завершить игру и сохранить", fontSize = 16.sp)
                     }
+
                     TextButton(
                         onClick = {
                             showActionsMenu = false
@@ -704,7 +700,6 @@ fun ScoreboardScreen(
                     ) {
                         Text("Подключить Google Drive", fontSize = 16.sp)
                     }
-
                 }
             },
             confirmButton = {
@@ -1124,10 +1119,10 @@ fun ScoreboardScreen(
                 TextButton(
                     onClick = {
                         showLineupsDialog = false
-
-                        // если игра уже начата или мы хотим фиксировать текущую конфигурацию,
-                        // обновляем JSON/Room/Drive с новым составом
                         if (!gameFinished) {
+                            // сначала фиксируем изменения составов в протокол
+                            logRosterChangesFromDialog()
+                            // потом обновляем JSON / Drive
                             notifyGameJsonUpdated(isFinal = false)
                         }
                     },
@@ -1136,6 +1131,7 @@ fun ScoreboardScreen(
                     Text("OK", fontSize = 16.sp)
                 }
             },
+
 
             dismissButton = {
                 TextButton(
@@ -1151,139 +1147,6 @@ fun ScoreboardScreen(
         )
     }
 
-    // --- ДИАЛОГ: БЫСТРЫЙ ПЕРЕНОС ИГРОКОВ ---
-
-    if (showTransferDialog && !gameFinished) {
-        val sortedRed = playersRed.sorted()
-        val sortedWhite = playersWhite.sorted()
-
-        AlertDialog(
-            onDismissRequest = { showTransferDialog = false },
-            title = { Text("Перенос игроков между командами", fontSize = 20.sp) },
-            text = {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .verticalScroll(rememberScrollState())
-                ) {
-                    if (sortedRed.isEmpty() && sortedWhite.isEmpty()) {
-                        Text(
-                            text = "Обе команды пусты.",
-                            fontSize = 16.sp,
-                            color = DialogTextColor
-                        )
-                    } else {
-                        if (sortedRed.isNotEmpty()) {
-                            Text(
-                                text = "Из Красных в Белые:",
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = DialogTitleColor
-                            )
-                            sortedRed.forEachIndexed { index, playerName ->
-                                if (index > 0) {
-                                    Divider(
-                                        modifier = Modifier.padding(vertical = 2.dp),
-                                        color = Color(0xFF37474F)
-                                    )
-                                }
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 2.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(
-                                        text = playerName,
-                                        modifier = Modifier.weight(1f),
-                                        color = DialogTextColor,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        fontSize = 16.sp
-                                    )
-                                    TextButton(
-                                        onClick = {
-                                            val newRed = playersRed.filterNot { it == playerName }
-                                            val newWhite = (playersWhite + playerName)
-                                            playersRedText = newRed.joinToString("\n")
-                                            playersWhiteText = newWhite.joinToString("\n")
-                                        },
-                                        colors = dialogButtonColors()
-                                    ) {
-                                        Text("→ БЕЛ", fontSize = 14.sp)
-                                    }
-                                }
-                            }
-                            Spacer(modifier = Modifier.height(8.dp))
-                        }
-
-                        if (sortedWhite.isNotEmpty()) {
-                            Text(
-                                text = "Из Белых в Красные:",
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = DialogTitleColor
-                            )
-                            sortedWhite.forEachIndexed { index, playerName ->
-                                if (index > 0) {
-                                    Divider(
-                                        modifier = Modifier.padding(vertical = 2.dp),
-                                        color = Color(0xFF37474F)
-                                    )
-                                }
-                                Row(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .padding(vertical = 2.dp),
-                                    verticalAlignment = Alignment.CenterVertically,
-                                    horizontalArrangement = Arrangement.SpaceBetween
-                                ) {
-                                    Text(
-                                        text = playerName,
-                                        modifier = Modifier.weight(1f),
-                                        color = DialogTextColor,
-                                        maxLines = 1,
-                                        overflow = TextOverflow.Ellipsis,
-                                        fontSize = 16.sp
-                                    )
-                                    TextButton(
-                                        onClick = {
-                                            val newWhite = playersWhite.filterNot { it == playerName }
-                                            val newRed = (playersRed + playerName)
-                                            playersWhiteText = newWhite.joinToString("\n")
-                                            playersRedText = newRed.joinToString("\n")
-                                        },
-                                        colors = dialogButtonColors()
-                                    ) {
-                                        Text("→ КР", fontSize = 14.sp)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showTransferDialog = false
-
-                        if (!gameFinished) {
-                            notifyGameJsonUpdated(isFinal = false)
-                        }
-                    },
-                    colors = dialogButtonColors()
-                ) {
-                    Text("OK", fontSize = 16.sp)
-                }
-            },
-
-            containerColor = DialogBackground,
-            titleContentColor = DialogTitleColor,
-            textContentColor = DialogTextColor
-        )
-    }
 
     // --- ДИАЛОГ: ВВОД / РЕДАКТИРОВАНИЕ ГОЛА ---
 
@@ -1378,7 +1241,7 @@ fun ScoreboardScreen(
             title = { Text("Гол $teamName", fontSize = 20.sp) },
             text = {
                 Text(
-                    text = formatGoal(goal),
+                    text = formatGoalText(goal),
                     color = DialogTextColor,
                     fontSize = 16.sp
                 )
@@ -1474,7 +1337,6 @@ fun ScoreboardScreen(
                         gameFinished = true
                         showFinishConfirm = false
                         showLineupsDialog = false
-                        showTransferDialog = false
                         resetGoalInput()
                         goalOptionsFor = null
                     },
@@ -1483,7 +1345,6 @@ fun ScoreboardScreen(
                     Text("Да, завершить", fontSize = 16.sp)
                 }
             },
-
             dismissButton = {
                 TextButton(
                     onClick = { showFinishConfirm = false },
@@ -1514,17 +1375,9 @@ fun ScoreboardScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        // 1) локально обнуляем состояние
                         resetGameState()
                         showNewGameConfirm = false
-
-                        // 2) сообщаем наружу: новая игра началась
-                        // (MainActivity очистит онлайн-папку и сбросит currentFileId)
                         onNewGameStarted()
-
-                        // 3) сразу создаём JSON с текущим счётом 0:0 и шлём наружу
-                        //    → MainActivity загрузит этот файл в активную папку на Drive
-                        notifyGameJsonUpdated(isFinal = false)
                     },
                     colors = dialogButtonColors()
                 ) {
@@ -1547,9 +1400,7 @@ fun ScoreboardScreen(
 
     // --- ДИАЛОГ: СПИСОК ЗАВЕРШЁННЫХ ИГР ---
 
-
     if (showHistoryDialog) {
-        // Берём список игр из локальной БД (индекс)
         val savedGames = remember { gameDao.getAllGames() }
 
         AlertDialog(
@@ -1641,14 +1492,14 @@ fun ScoreboardScreen(
         )
     }
 
-
-    // --- ДИАЛОГ: ПРОСМОТР ПРОТОКОЛА (+ УДАЛЕНИЕ / ЭКСПОРТ ИГРЫ) ---
+    // --- ДИАЛОГ: ПРОСМОТР ПРОТОКОЛА (+ УДАЛЕНИЕ / ЭКСПОРТ) ---
 
     if (showHistoryDetailsDialog) {
         AlertDialog(
             onDismissRequest = {
                 showHistoryDetailsDialog = false
                 historyDetailsText = ""
+                historySelectedEntry = null
                 historySelectedFile = null
             },
             title = { Text("Протокол матча", fontSize = 20.sp) },
@@ -1666,7 +1517,6 @@ fun ScoreboardScreen(
                     )
                 }
             },
-            // три маленькие иконки вместо длинных надписей
             confirmButton = {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -1702,6 +1552,7 @@ fun ScoreboardScreen(
                         onClick = {
                             showHistoryDetailsDialog = false
                             historyDetailsText = ""
+                            historySelectedEntry = null
                             historySelectedFile = null
                         }
                     ) {
@@ -1735,16 +1586,12 @@ fun ScoreboardScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        // сначала удаляем запись в БД (если есть)
-                        historySelectedEntry?.let { entry ->
-                            gameDao.deleteGameById(entry.gameId)
-                        }
+                        val entry = historySelectedEntry
+                        val file = historySelectedFile
 
-                        // затем удаляем сам файл
-                        historySelectedFile?.let { file ->
-                            if (file.exists()) {
-                                file.delete()
-                            }
+                        if (entry != null) {
+                            // отдаем решение наверх: что делать с локальной БД, файлами и Drive
+                            onGameDeleted(entry.gameId, file)
                         }
 
                         historySelectedEntry = null
@@ -1759,6 +1606,7 @@ fun ScoreboardScreen(
                     Text("Да, удалить", fontSize = 16.sp)
                 }
             },
+
             dismissButton = {
                 TextButton(
                     onClick = {
@@ -1775,7 +1623,7 @@ fun ScoreboardScreen(
         )
     }
 
-    // --- ДИАЛОГ: ЛУЧШИЕ СНАЙПЕРЫ (ТАБЛИЦА) ---
+    // --- ДИАЛОГ: ЛУЧШИЕ СНАЙПЕРЫ ---
 
     if (showTopScorersDialog) {
         AlertDialog(
@@ -1925,7 +1773,7 @@ fun ScoreboardScreen(
         )
     }
 
-    // --- ДИАЛОГ: ЛУЧШИЕ БОМБАРДИРЫ (ТАБЛИЦА) ---
+    // --- ДИАЛОГ: ЛУЧШИЕ БОМБАРДИРЫ ---
 
     if (showTopBombersDialog) {
         AlertDialog(
@@ -2076,65 +1924,10 @@ fun ScoreboardScreen(
     }
 }
 
-@Composable
-private fun TeamScoreCard(
-    teamName: String,
-    score: Int,
-    backgroundColor: Color,
-    textColor: Color,
-    modifier: Modifier = Modifier,
-    onClick: () -> Unit
-) {
-    Card(
-        modifier = modifier
-            .padding(8.dp)
-            .clickable { onClick() },
-        colors = CardDefaults.cardColors(
-            containerColor = backgroundColor
-        ),
-        elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
-    ) {
-        Column(
-            modifier = Modifier
-                .padding(vertical = 16.dp, horizontal = 8.dp)
-                .fillMaxWidth(),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text(
-                text = teamName,
-                fontSize = 18.sp,
-                fontWeight = FontWeight.Medium,
-                color = textColor
-            )
-            Spacer(modifier = Modifier.height(4.dp))
-            Text(
-                text = score.toString(),
-                fontSize = 56.sp,
-                fontWeight = FontWeight.ExtraBold,
-                color = textColor
-            )
-        }
-    }
-}
-
-private fun formatGoal(goal: GoalEvent): String {
-    val assists = listOfNotNull(goal.assist1, goal.assist2)
-    return if (assists.isEmpty()) {
-        goal.scorer
-    } else {
-        "${goal.scorer} (${assists.joinToString(", ")})"
-    }
-}
-
 @Preview(showBackground = true)
 @Composable
 fun PreviewScoreboard() {
-    val context = LocalContext.current
-    val gameRepo = remember { GameRepository(context) }
-
     HockeyScoreboardTheme {
-        ScoreboardScreen(
-            gameRepository = gameRepo
-        )
+        ScoreboardScreen()
     }
 }

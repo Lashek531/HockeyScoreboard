@@ -13,7 +13,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
-import com.example.hockeyscoreboard.data.DriveRepository
 import com.example.hockeyscoreboard.data.GameRepository
 import com.example.hockeyscoreboard.ui.theme.HockeyScoreboardTheme
 import com.google.android.gms.auth.GoogleAuthUtil
@@ -27,8 +26,25 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
+import com.example.hockeyscoreboard.data.db.GameDatabase
+import com.example.hockeyscoreboard.data.DriveRepository
+import androidx.lifecycle.lifecycleScope
+
 
 class MainActivity : ComponentActivity() {
+
+    // Локальная БД с играми
+    private val gameDb by lazy {
+        GameDatabase.getInstance(this)
+    }
+
+    // Репозиторий работы с Google Drive
+    private val driveRepository by lazy {
+        DriveRepository(
+            activeFolderId = DRIVE_ACTIVE_FOLDER_ID,
+            archiveFolderId = DRIVE_ARCHIVE_FOLDER_ID
+        )
+    }
 
     companion object {
         /** Папка Google Drive для текущих (онлайн) игр */
@@ -187,7 +203,6 @@ class MainActivity : ComponentActivity() {
             HockeyScoreboardTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     ScoreboardScreen(
-                        gameRepository = gameRepo,
                         driveAccountEmail = driveAccountEmail,
                         onConnectDrive = { startGoogleSignIn() },
 
@@ -210,11 +225,27 @@ class MainActivity : ComponentActivity() {
                             requestDriveToken { token ->
                                 lifecycleScope.launch(Dispatchers.IO) {
                                     driveRepo.clearActiveFolder(token)
-                                    // можно без тостов, это фоновый сервис
+                                    // без тостов, это фоновая операция
                                 }
                             }
-                        }
+                        },
+                        onGameDeleted = { gameId, file ->
+                            lifecycleScope.launch {
+                                // 1. удалить запись из Room
+                                gameDb.gameDao().deleteGameById(gameId)
 
+                                // 2. удалить локальный файл
+                                file?.let {
+                                    if (it.exists()) it.delete()
+                                }
+
+                                // 3. удалить файл на Google Drive
+                                driveRepository.deleteGameFileOnDrive(
+                                    localFile = file,
+                                    gameId = gameId
+                                )
+                            }
+                        }
                     )
                 }
             }

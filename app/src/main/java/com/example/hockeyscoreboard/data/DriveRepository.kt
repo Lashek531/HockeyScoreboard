@@ -17,7 +17,7 @@ data class DriveResult(
 /**
  * Работа с Google Drive:
  *  - загрузка/обновление онлайн-файла в ACTIVE-папке
- *  - копирование файла в ARCHIVE-папку при завершении игры
+ *  - копирование файла в ARCHIVE-папке при завершении игры
  *  - очистка ACTIVE-папки при начале НОВОЙ игры
  */
 class DriveRepository(
@@ -276,6 +276,17 @@ class DriveRepository(
                 errorMessage = "Исключение при очистке онлайн-папки: ${e.message}"
             )
         }
+    }
+
+    /**
+     * Удаление файла игры с Google Drive.
+     * Пока заглушка — фактическое удаление не реализовано.
+     */
+    suspend fun deleteGameFileOnDrive(
+        localFile: File?,
+        gameId: String
+    ) {
+        // TODO: реализовать удаление файла на Google Drive по gameId / имени / driveFileId
     }
 
     // --- утилита чтения тела ответа ---
