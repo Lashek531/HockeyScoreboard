@@ -38,6 +38,8 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import com.example.hockeyscoreboard.data.syncGamesFolderToRoom
+
 
 // --- Цвета для всплывающих окон в общем стиле ---
 
@@ -643,6 +645,25 @@ fun ScoreboardScreen(
                     ) {
                         Text("Завершённые игры", fontSize = 16.sp)
                     }
+                    TextButton(
+                        onClick = {
+                            showActionsMenu = false
+                            // Сканируем папку games и добавляем новые игры в Room
+                            val added = syncGamesFolderToRoom(context, gameDao)
+                            Toast.makeText(
+                                context,
+                                if (added > 0)
+                                    "Добавлено игр в список: $added"
+                                else
+                                    "Новых игр в папке не найдено",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        },
+                        colors = dialogButtonColors()
+                    ) {
+                        Text("Сканировать папку игр", fontSize = 16.sp)
+                    }
+
 
                     TextButton(
                         onClick = {

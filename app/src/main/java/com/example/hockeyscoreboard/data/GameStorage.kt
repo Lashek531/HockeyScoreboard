@@ -6,6 +6,11 @@ import com.example.hockeyscoreboard.model.PlayerStatsRow
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import com.example.hockeyscoreboard.data.db.GameDao
+import com.example.hockeyscoreboard.data.db.GameEntry
+import java.text.SimpleDateFormat
+import java.util.Locale
+
 
 // Внутренние вспомогательные модели для разбора JSON протокола
 
@@ -291,4 +296,76 @@ fun buildTopBombersRows(stats: Map<String, PlayerStats>): List<PlayerStatsRow> {
             points = st.points
         )
     }
+}
+
+/**
+ * Сканируем локальную папку games и добавляем в Room все json-файлы,
+ * которых ещё нет в таблице games.
+ *
+ * Возвращает количество ДОБАВЛЕННЫХ (новых) игр.
+ */
+fun syncGamesFolderToRoom(
+    context: Context,
+    gameDao: GameDao
+): Int {
+    val filesOnDisk = listSavedGames(context)
+    if (filesOnDisk.isEmpty()) return 0
+
+    // Уже известные игры в Room по имени файла
+    val existingByFileName = gameDao.getAllGames().associateBy { it.fileName }
+
+    var addedCount = 0
+
+    // Формат даты такой же, как в buildGameJson()
+    val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
+
+    for (file in filesOnDisk) {
+        // Если игра с таким именем файла уже есть в Room — пропускаем
+        if (existingByFileName.containsKey(file.name)) continue
+
+        try {
+            val text = file.readText(Charsets.UTF_8)
+            val root = JSONObject(text)
+
+            // gameId: либо из json, либо из имени файла без .json
+            val gameId = root.optString(
+                "gameId",
+                file.name.removeSuffix(".json")
+            )
+
+            // Дата начала игры
+            val dateStr = root.optString("date", null)
+            val startedAt = if (!dateStr.isNullOrBlank()) {
+                try {
+                    isoFormat.parse(dateStr)?.time ?: file.lastModified()
+                } catch (_: Exception) {
+                    file.lastModified()
+                }
+            } else {
+                file.lastModified()
+            }
+
+            // Счёт из finalScore
+            val finalScoreObj = root.optJSONObject("finalScore")
+            val redScore = finalScoreObj?.optInt("RED", 0) ?: 0
+            val whiteScore = finalScoreObj?.optInt("WHITE", 0) ?: 0
+
+            val entry = GameEntry(
+                gameId = gameId,
+                fileName = file.name,
+                localPath = file.absolutePath,
+                startedAt = startedAt,
+                finishedAt = null,
+                redScore = redScore,
+                whiteScore = whiteScore
+            )
+
+            gameDao.upsertGame(entry)
+            addedCount++
+        } catch (_: Exception) {
+            // битый или чужой файл — просто пропускаем
+        }
+    }
+
+    return addedCount
 }
