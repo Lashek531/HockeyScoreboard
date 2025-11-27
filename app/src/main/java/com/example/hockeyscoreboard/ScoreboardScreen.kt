@@ -38,6 +38,9 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import com.example.hockeyscoreboard.data.db.GameDatabase
+import com.example.hockeyscoreboard.data.db.GameEntry
+
 
 // --- Цвета для всплывающих окон в общем стиле ---
 
@@ -59,6 +62,7 @@ private fun dialogDangerButtonColors() = ButtonDefaults.textButtonColors(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ScoreboardScreen(
+    gameRepository: GameRepository,
     driveAccountEmail: String? = null,
     onConnectDrive: () -> Unit = {},
     onGameSaved: (File) -> Unit = {},
@@ -69,6 +73,10 @@ fun ScoreboardScreen(
     val prefs = remember {
         context.getSharedPreferences("hockey_prefs", Context.MODE_PRIVATE)
     }
+    // --- Локальная БД для индекса игр ---
+    val gameDb = remember { GameDatabase.getInstance(context) }
+    val gameDao = remember { gameDb.gameDao() }
+
 
     // --- БАЗОВЫЙ СПИСОК ИГРОКОВ (имена + роль + рейтинг) ---
 
@@ -117,12 +125,12 @@ fun ScoreboardScreen(
     var topBombersRows by remember { mutableStateOf<List<PlayerStatsRow>>(emptyList()) }
 
     // текущая выбранная игра (файл) для просмотра протокола
+    var historySelectedEntry by remember { mutableStateOf<GameEntry?>(null) }
     var historySelectedFile by remember { mutableStateOf<File?>(null) }
     var historyDetailsText by remember { mutableStateOf("") }
 
     // подтверждение удаления сохранённой игры
     var showDeleteGameConfirm by remember { mutableStateOf(false) }
-
     // --- ИГРА / ГОЛЫ ---
 
     var goals by rememberSaveable(stateSaver = GoalEventListSaver) {
@@ -213,6 +221,7 @@ fun ScoreboardScreen(
         root.put("date", dateIso)
         root.put("finished", isFinal)   // флаг завершения игры
 
+        // --- Команды и составы ---
         val teamsObj = JSONObject()
         val redObj = JSONObject()
         val whiteObj = JSONObject()
@@ -233,7 +242,7 @@ fun ScoreboardScreen(
 
         root.put("teams", teamsObj)
 
-// Текущий счёт считаем по списку голов на момент вызова
+        // --- Итоговый счёт на момент сохранения ---
         val currentRedScore = goals.count { it.team == Team.RED }
         val currentWhiteScore = goals.count { it.team == Team.WHITE }
 
@@ -242,13 +251,14 @@ fun ScoreboardScreen(
         scoreObj.put("WHITE", currentWhiteScore)
         root.put("finalScore", scoreObj)
 
-
+        // --- Список голов по ходу матча ---
         val goalsArray = JSONArray()
         var runningRed = 0
         var runningWhite = 0
 
         goals.forEachIndexed { index, goal ->
             if (goal.team == Team.RED) runningRed++ else runningWhite++
+
             val goalObj = JSONObject()
             goalObj.put("index", index + 1)
             goalObj.put("team", goal.team.name)
@@ -256,37 +266,61 @@ fun ScoreboardScreen(
             goalObj.put("scorer", goal.scorer)
             goalObj.put("assist1", goal.assist1)
             goalObj.put("assist2", goal.assist2)
+
             goalsArray.put(goalObj)
         }
 
+        // ВАЖНО: раньше этой строки не было — из-за этого в JSON не было голов
         root.put("goals", goalsArray)
 
         return fileName to root.toString(2)
     }
 
+
+
     /**
-     * Реально сохраняем JSON в файл в каталоге files/games и возвращаем File.
+     * Реально сохраняем JSON в файл в каталоге games (через GameRepository) и возвращаем File.
      * Тот же файл используем и для Drive, и для локальной истории.
      */
     fun saveGameJsonToFile(isFinal: Boolean = false): File {
         val (fileName, json) = buildGameJson(isFinal)
-
-        // Папка .../files/games
-        val dir = File(context.getExternalFilesDir(null), "games")
-        if (!dir.exists()) dir.mkdirs()
-
-        val file = File(dir, fileName)
-        file.writeText(json, Charsets.UTF_8)
-        return file
+        return gameRepository.saveGameJson(fileName, json)
     }
 
     /**
      * Автообновление JSON при любом изменении голов.
      */
     fun notifyGameJsonUpdated(isFinal: Boolean = false) {
+        // 1. сохраняем JSON на диск
         val file = saveGameJsonToFile(isFinal)
-        onGameJsonUpdated(file)
+
+        // 2. обновляем индекс игры в локальной БД
+        val now = System.currentTimeMillis()
+        val finishedAt = if (isFinal) now else null
+        val startedAt = gameStartMillis ?: now
+        val gameId = file.name.removeSuffix(".json")
+
+        val entry = GameEntry(
+            gameId = gameId,
+            fileName = file.name,
+            localPath = file.absolutePath,
+            startedAt = startedAt,
+            finishedAt = finishedAt,
+            redScore = redScore,
+            whiteScore = whiteScore
+        )
+        gameDao.upsertGame(entry)
+
+        // 3. уведомляем наружу – что делать с этим файлом
+        if (isFinal) {
+            // финальный файл → MainActivity отправит его в архив на Drive
+            onGameSaved(file)
+        } else {
+            // обычное обновление по ходу игры
+            onGameJsonUpdated(file)
+        }
     }
+
 
     fun commitGoalIfPossible() {
         if (gameFinished) return
@@ -324,7 +358,6 @@ fun ScoreboardScreen(
             }
         }
     }
-
 
     // Экспорт JSON-файла сохранённого матча через системный Share Sheet
     fun exportGameFile(context: Context, file: File) {
@@ -390,12 +423,11 @@ fun ScoreboardScreen(
                 },
                 actions = {
                     // Индикация статуса Google Drive
-                    // Индикация статуса Google Drive
                     Icon(
                         imageVector = if (driveAccountEmail != null)
-                            Icons.Filled.Share      // есть во всех версиях
+                            Icons.Filled.Share
                         else
-                            Icons.Filled.Close,     // есть во всех версиях
+                            Icons.Filled.Close,
                         contentDescription = if (driveAccountEmail != null)
                             "Google Drive подключён"
                         else
@@ -620,8 +652,8 @@ fun ScoreboardScreen(
                     TextButton(
                         onClick = {
                             showActionsMenu = false
-                            val stats = collectPlayerStats(context)
-                            topScorersRows = buildTopScorersRows(stats)
+                            val stats = gameRepository.collectPlayerStats()
+                            topScorersRows = gameRepository.buildTopScorersRows(stats)
                             showTopScorersDialog = true
                         },
                         colors = dialogButtonColors()
@@ -632,8 +664,8 @@ fun ScoreboardScreen(
                     TextButton(
                         onClick = {
                             showActionsMenu = false
-                            val stats = collectPlayerStats(context)
-                            topBombersRows = buildTopBombersRows(stats)
+                            val stats = gameRepository.collectPlayerStats()
+                            topBombersRows = gameRepository.buildTopBombersRows(stats)
                             showTopBombersDialog = true
                         },
                         colors = dialogButtonColors()
@@ -689,7 +721,7 @@ fun ScoreboardScreen(
         )
     }
 
-    // --- ДИАЛОГ: БАЗОВЫЙ СПИСОК ИГРОКОВ (имя + иконка амплуа + рейтинг + удалить) ---
+    // --- ДИАЛОГ: БАЗОВЫЙ СПИСОК ИГРОКОВ ---
 
     if (showBasePlayersDialog && !gameFinished) {
         AlertDialog(
@@ -885,7 +917,7 @@ fun ScoreboardScreen(
         )
     }
 
-    // --- ДИАЛОГ: СОСТАВЫ КОМАНД (по алфавиту) ---
+    // --- ДИАЛОГ: СОСТАВЫ КОМАНД ---
 
     if (showLineupsDialog && !gameFinished) {
         val sortedRed = playersRed.sorted()
@@ -1090,12 +1122,21 @@ fun ScoreboardScreen(
             },
             confirmButton = {
                 TextButton(
-                    onClick = { showLineupsDialog = false },
+                    onClick = {
+                        showLineupsDialog = false
+
+                        // если игра уже начата или мы хотим фиксировать текущую конфигурацию,
+                        // обновляем JSON/Room/Drive с новым составом
+                        if (!gameFinished) {
+                            notifyGameJsonUpdated(isFinal = false)
+                        }
+                    },
                     colors = dialogButtonColors()
                 ) {
                     Text("OK", fontSize = 16.sp)
                 }
             },
+
             dismissButton = {
                 TextButton(
                     onClick = { showLineupsDialog = false },
@@ -1110,7 +1151,7 @@ fun ScoreboardScreen(
         )
     }
 
-    // --- ДИАЛОГ: БЫСТРЫЙ ПЕРЕНОС ИГРОКОВ (сортировка по алфавиту) ---
+    // --- ДИАЛОГ: БЫСТРЫЙ ПЕРЕНОС ИГРОКОВ ---
 
     if (showTransferDialog && !gameFinished) {
         val sortedRed = playersRed.sorted()
@@ -1225,12 +1266,19 @@ fun ScoreboardScreen(
             },
             confirmButton = {
                 TextButton(
-                    onClick = { showTransferDialog = false },
+                    onClick = {
+                        showTransferDialog = false
+
+                        if (!gameFinished) {
+                            notifyGameJsonUpdated(isFinal = false)
+                        }
+                    },
                     colors = dialogButtonColors()
                 ) {
                     Text("OK", fontSize = 16.sp)
                 }
             },
+
             containerColor = DialogBackground,
             titleContentColor = DialogTitleColor,
             textContentColor = DialogTextColor
@@ -1420,9 +1468,8 @@ fun ScoreboardScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        // Финальное сохранение JSON и отправка наружу
-                        val file = saveGameJsonToFile(isFinal = true)
-                        onGameSaved(file)
+                        // единая точка: JSON + Room + Drive (финально)
+                        notifyGameJsonUpdated(isFinal = true)
 
                         gameFinished = true
                         showFinishConfirm = false
@@ -1436,6 +1483,7 @@ fun ScoreboardScreen(
                     Text("Да, завершить", fontSize = 16.sp)
                 }
             },
+
             dismissButton = {
                 TextButton(
                     onClick = { showFinishConfirm = false },
@@ -1466,9 +1514,17 @@ fun ScoreboardScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
+                        // 1) локально обнуляем состояние
                         resetGameState()
                         showNewGameConfirm = false
-                        onNewGameStarted()        // <- сообщаем MainActivity: началась новая игра
+
+                        // 2) сообщаем наружу: новая игра началась
+                        // (MainActivity очистит онлайн-папку и сбросит currentFileId)
+                        onNewGameStarted()
+
+                        // 3) сразу создаём JSON с текущим счётом 0:0 и шлём наружу
+                        //    → MainActivity загрузит этот файл в активную папку на Drive
+                        notifyGameJsonUpdated(isFinal = false)
                     },
                     colors = dialogButtonColors()
                 ) {
@@ -1491,14 +1547,17 @@ fun ScoreboardScreen(
 
     // --- ДИАЛОГ: СПИСОК ЗАВЕРШЁННЫХ ИГР ---
 
+
     if (showHistoryDialog) {
-        val savedGames = listSavedGames(context)
+        // Берём список игр из локальной БД (индекс)
+        val savedGames = remember { gameDao.getAllGames() }
 
         AlertDialog(
             onDismissRequest = {
                 showHistoryDialog = false
                 showHistoryDetailsDialog = false
                 historyDetailsText = ""
+                historySelectedEntry = null
                 historySelectedFile = null
             },
             title = { Text("Завершённые игры", fontSize = 20.sp) },
@@ -1520,19 +1579,38 @@ fun ScoreboardScreen(
                                 .fillMaxWidth()
                                 .verticalScroll(rememberScrollState())
                         ) {
-                            savedGames.forEach { file ->
+                            savedGames.forEach { entry ->
                                 TextButton(
                                     onClick = {
-                                        historySelectedFile = file
-                                        historyDetailsText = loadHistoryDetails(file)
-                                        showHistoryDialog = false
-                                        showHistoryDetailsDialog = true
+                                        val path = entry.localPath
+                                        if (path.isNullOrBlank()) {
+                                            Toast.makeText(
+                                                context,
+                                                "Файл для этой игры не найден",
+                                                Toast.LENGTH_LONG
+                                            ).show()
+                                        } else {
+                                            val file = File(path)
+                                            if (!file.exists()) {
+                                                Toast.makeText(
+                                                    context,
+                                                    "Файл ${file.name} отсутствует",
+                                                    Toast.LENGTH_LONG
+                                                ).show()
+                                            } else {
+                                                historySelectedEntry = entry
+                                                historySelectedFile = file
+                                                historyDetailsText = loadHistoryDetails(file)
+                                                showHistoryDialog = false
+                                                showHistoryDetailsDialog = true
+                                            }
+                                        }
                                     },
                                     modifier = Modifier.fillMaxWidth(),
                                     colors = dialogButtonColors()
                                 ) {
                                     Text(
-                                        text = file.name,
+                                        text = "${entry.fileName}   (${entry.redScore}:${entry.whiteScore})",
                                         textAlign = TextAlign.Start,
                                         modifier = Modifier.fillMaxWidth(),
                                         fontSize = 16.sp
@@ -1549,6 +1627,7 @@ fun ScoreboardScreen(
                         showHistoryDialog = false
                         showHistoryDetailsDialog = false
                         historyDetailsText = ""
+                        historySelectedEntry = null
                         historySelectedFile = null
                     },
                     colors = dialogButtonColors()
@@ -1561,6 +1640,7 @@ fun ScoreboardScreen(
             textContentColor = DialogTextColor
         )
     }
+
 
     // --- ДИАЛОГ: ПРОСМОТР ПРОТОКОЛА (+ УДАЛЕНИЕ / ЭКСПОРТ ИГРЫ) ---
 
@@ -1655,11 +1735,19 @@ fun ScoreboardScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
+                        // сначала удаляем запись в БД (если есть)
+                        historySelectedEntry?.let { entry ->
+                            gameDao.deleteGameById(entry.gameId)
+                        }
+
+                        // затем удаляем сам файл
                         historySelectedFile?.let { file ->
                             if (file.exists()) {
                                 file.delete()
                             }
                         }
+
+                        historySelectedEntry = null
                         historySelectedFile = null
                         historyDetailsText = ""
                         showDeleteGameConfirm = false
@@ -2041,7 +2129,12 @@ private fun formatGoal(goal: GoalEvent): String {
 @Preview(showBackground = true)
 @Composable
 fun PreviewScoreboard() {
+    val context = LocalContext.current
+    val gameRepo = remember { GameRepository(context) }
+
     HockeyScoreboardTheme {
-        ScoreboardScreen()
+        ScoreboardScreen(
+            gameRepository = gameRepo
+        )
     }
 }

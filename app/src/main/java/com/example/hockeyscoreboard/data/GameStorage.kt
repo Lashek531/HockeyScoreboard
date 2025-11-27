@@ -10,7 +10,7 @@ import java.io.File
 // Папка с файлами игр
 fun getGamesDir(context: Context): File {
     val baseDir = context.getExternalFilesDir(null)
-    return File(baseDir, "HockeyScoreboard")
+    return File(baseDir, "games")
 }
 
 // Список сохранённых игр (.json), отсортированный по дате (новые сверху)
@@ -173,8 +173,6 @@ fun buildTopScorersRows(stats: Map<String, PlayerStats>): List<PlayerStatsRow> {
         )
     }
 }
-
-
 
 // Построение таблицы "Лучшие бомбардиры"
 fun buildTopBombersRows(stats: Map<String, PlayerStats>): List<PlayerStatsRow> {
