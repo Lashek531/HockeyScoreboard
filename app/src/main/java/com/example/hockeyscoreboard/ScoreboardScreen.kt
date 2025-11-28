@@ -66,7 +66,8 @@ fun ScoreboardScreen(
     onGameSaved: (File) -> Unit = {},
     onGameJsonUpdated: (File) -> Unit = {},
     onNewGameStarted: () -> Unit = {},
-    onGameDeleted: (gameId: String, file: File?) -> Unit = { _, _ -> }
+    onGameDeleted: (gameId: String, file: File?) -> Unit = { _, _ -> },
+    onSyncWithDrive: () -> Unit = {}
 
 
 ) {
@@ -117,6 +118,8 @@ fun ScoreboardScreen(
     var showNewGameConfirm by remember { mutableStateOf(false) }
     var showActionsMenu by remember { mutableStateOf(false) }
     var showNoTeamsDialog by remember { mutableStateOf(false) }
+    var showSettingsDialog by remember { mutableStateOf(false) }
+
 
     // новые окна статистики
     var showTopScorersDialog by remember { mutableStateOf(false) }
@@ -604,16 +607,6 @@ fun ScoreboardScreen(
                         modifier = Modifier.padding(bottom = 8.dp)
                     )
 
-                    TextButton(
-                        onClick = {
-                            showActionsMenu = false
-                            if (!gameFinished) showBasePlayersDialog = true
-                        },
-                        enabled = !gameFinished,
-                        colors = dialogButtonColors()
-                    ) {
-                        Text("Базовый список игроков", fontSize = 16.sp)
-                    }
 
                     TextButton(
                         onClick = {
@@ -645,24 +638,7 @@ fun ScoreboardScreen(
                     ) {
                         Text("Завершённые игры", fontSize = 16.sp)
                     }
-                    TextButton(
-                        onClick = {
-                            showActionsMenu = false
-                            // Сканируем папку games и добавляем новые игры в Room
-                            val added = syncGamesFolderToRoom(context, gameDao)
-                            Toast.makeText(
-                                context,
-                                if (added > 0)
-                                    "Добавлено игр в список: $added"
-                                else
-                                    "Новых игр в папке не найдено",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        },
-                        colors = dialogButtonColors()
-                    ) {
-                        Text("Сканировать папку игр", fontSize = 16.sp)
-                    }
+
 
 
                     TextButton(
@@ -715,12 +691,13 @@ fun ScoreboardScreen(
                     TextButton(
                         onClick = {
                             showActionsMenu = false
-                            onConnectDrive()
+                            showSettingsDialog = true
                         },
                         colors = dialogButtonColors()
                     ) {
-                        Text("Подключить Google Drive", fontSize = 16.sp)
+                        Text("Настройки", fontSize = 16.sp)
                     }
+
                 }
             },
             confirmButton = {
@@ -932,6 +909,100 @@ fun ScoreboardScreen(
             textContentColor = DialogTextColor
         )
     }
+
+    // --- ДИАЛОГ: НАСТРОЙКИ ---
+
+    if (showSettingsDialog) {
+        AlertDialog(
+            onDismissRequest = { showSettingsDialog = false },
+            title = { Text("Настройки", fontSize = 20.sp) },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    // Статус Google Drive
+                    Text(
+                        text = if (driveAccountEmail != null)
+                            "Google Drive: подключено (${driveAccountEmail})"
+                        else
+                            "Google Drive: не подключено",
+                        fontSize = 14.sp,
+                        color = DialogTextColor,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+
+                    // Базовый список игроков
+                    TextButton(
+                        onClick = {
+                            showSettingsDialog = false
+                            if (!gameFinished) {
+                                showBasePlayersDialog = true
+                            }
+                        },
+                        enabled = !gameFinished,
+                        colors = dialogButtonColors()
+                    ) {
+                        Text("Базовый список игроков", fontSize = 16.sp)
+                    }
+
+                    // Сканировать папку игр
+                    TextButton(
+                        onClick = {
+                            showSettingsDialog = false
+                            val added = syncGamesFolderToRoom(context, gameDao)
+                            Toast.makeText(
+                                context,
+                                if (added > 0)
+                                    "Добавлено игр в список: $added"
+                                else
+                                    "Новых игр в папке не найдено",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        },
+                        colors = dialogButtonColors()
+                    ) {
+                        Text("Сканировать папку игр", fontSize = 16.sp)
+                    }
+
+                    // Проверить и синхронизировать с Google Диском
+                    TextButton(
+                        onClick = {
+                            showSettingsDialog = false
+                            onSyncWithDrive()
+                        },
+                        colors = dialogButtonColors()
+                    ) {
+                        Text("Проверить и синхронизировать с Google Диском", fontSize = 16.sp)
+                    }
+
+                    // Подключить Google Drive
+                    TextButton(
+                        onClick = {
+                            showSettingsDialog = false
+                            onConnectDrive()
+                        },
+                        colors = dialogButtonColors()
+                    ) {
+                        Text("Подключить Google Drive", fontSize = 16.sp)
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = { showSettingsDialog = false },
+                    colors = dialogButtonColors()
+                ) {
+                    Text("Закрыть", fontSize = 16.sp)
+                }
+            },
+            containerColor = DialogBackground,
+            titleContentColor = DialogTitleColor,
+            textContentColor = DialogTextColor
+        )
+    }
+
 
     // --- ДИАЛОГ: СОСТАВЫ КОМАНД ---
 

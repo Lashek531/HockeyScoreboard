@@ -159,6 +159,187 @@ class DriveRepository(
     }
 
     /**
+     * Гарантирует наличие архивного файла игры в ARCHIVE-папке.
+     *
+     * Логика:
+     *  - если archiveFolderId пустой → считаем, что синхронизация не нужна → success = true;
+     *  - если файла с таким именем нет в архивной папке → загружаем его туда;
+     *  - если файл уже есть → ничего не делаем.
+     *
+     * DriveResult:
+     *  success = true,  isUpdate = true  → файл уже был на Google Drive;
+     *  success = true,  isUpdate = false → файл был дозагружен;
+     *  success = false                  → ошибка (см. errorMessage).
+     */
+    suspend fun ensureGameInArchive(
+        token: String,
+        file: File
+    ): DriveResult {
+        return try {
+            if (archiveFolderId.isBlank()) {
+                // Архивная папка не настроена — формально считаем, что всё ок.
+                DriveResult(success = true, isUpdate = true)
+            } else if (!file.exists()) {
+                DriveResult(
+                    success = false,
+                    errorMessage = "Локальный файл не найден: ${file.absolutePath}"
+                )
+            } else {
+                val fileName = file.name
+
+                // 1. Проверяем, есть ли файл с таким именем в архивной папке
+                val alreadyExists = isFileInArchive(token, fileName)
+                if (alreadyExists) {
+                    DriveResult(
+                        success = true,
+                        isUpdate = true
+                    )
+                } else {
+                    // 2. Файла нет — дозагружаем в архив
+                    uploadFileToArchive(token, file)
+                }
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            DriveResult(
+                success = false,
+                errorMessage = "Ошибка ensureGameInArchive: ${e.message}"
+            )
+        }
+    }
+
+
+    /**
+     * Проверяет, существует ли в архивной папке файл с указанным именем.
+     */
+    private fun isFileInArchive(
+        token: String,
+        fileName: String
+    ): Boolean {
+        if (archiveFolderId.isBlank()) return true
+
+        val query = URLEncoder.encode(
+            "'$archiveFolderId' in parents and name = '$fileName' and trashed = false",
+            "UTF-8"
+        )
+
+        val url = URL(
+            "https://www.googleapis.com/drive/v3/files?q=$query&fields=files(id,name)"
+        )
+
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            setRequestProperty("Authorization", "Bearer $token")
+            setRequestProperty("Accept", "application/json")
+        }
+
+        val code = connection.responseCode
+        val body = readBody(connection, code)
+
+        if (code !in 200..299) {
+            // При ошибке считаем, что файла нет — пусть дозагрузка пробует ещё раз.
+            return false
+        }
+
+        return try {
+            val json = JSONObject(body ?: "{}")
+            val files = json.optJSONArray("files")
+            files != null && files.length() > 0
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+
+    /**
+     * Загружает JSON-файл напрямую в архивную папку (archiveFolderId),
+     * минуя ACTIVE-папку и copy.
+     */
+    private fun uploadFileToArchive(
+        token: String,
+        file: File
+    ): DriveResult {
+        if (archiveFolderId.isBlank()) {
+            return DriveResult(success = true, isUpdate = true)
+        }
+
+        val boundary = "HockeyScoreboardArchive_${System.currentTimeMillis()}"
+        val url = URL("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart")
+
+        val connection = (url.openConnection() as HttpURLConnection).apply {
+            requestMethod = "POST"
+            doOutput = true
+            setRequestProperty("Authorization", "Bearer $token")
+            setRequestProperty("Content-Type", "multipart/related; boundary=$boundary")
+            setRequestProperty("Accept", "application/json")
+        }
+
+        val lineEnd = "\r\n"
+        val twoHyphens = "--"
+
+        // метаданные: имя файла + родительская папка (архив)
+        val metadataJson = """{
+            "name": "${file.name}",
+            "parents": ["$archiveFolderId"]
+        }""".trimIndent()
+
+        return try {
+            connection.outputStream.use { out ->
+                // metadata part
+                val metaPart = buildString {
+                    append(twoHyphens).append(boundary).append(lineEnd)
+                    append("Content-Type: application/json; charset=UTF-8").append(lineEnd)
+                    append(lineEnd)
+                    append(metadataJson).append(lineEnd)
+                }
+                out.write(metaPart.toByteArray(Charsets.UTF_8))
+
+                // file part
+                val fileHeaderPart = buildString {
+                    append(twoHyphens).append(boundary).append(lineEnd)
+                    append("Content-Type: application/json; charset=UTF-8").append(lineEnd)
+                    append(lineEnd)
+                }
+                out.write(fileHeaderPart.toByteArray(Charsets.UTF_8))
+
+                file.inputStream().use { input ->
+                    input.copyTo(out)
+                }
+
+                // end boundary
+                val endPart = buildString {
+                    append(lineEnd)
+                    append(twoHyphens).append(boundary).append(twoHyphens).append(lineEnd)
+                }
+                out.write(endPart.toByteArray(Charsets.UTF_8))
+                out.flush()
+            }
+
+            val code = connection.responseCode
+            val body = readBody(connection, code)
+
+            if (code in 200..299) {
+                DriveResult(
+                    success = true,
+                    isUpdate = false
+                )
+            } else {
+                DriveResult(
+                    success = false,
+                    errorMessage = "Ошибка дозагрузки в архив: $code\n${body ?: ""}"
+                )
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            DriveResult(
+                success = false,
+                errorMessage = "Исключение при дозагрузке в архив: ${e.message}"
+            )
+        }
+    }
+
+
+    /**
      * Копирование файла из ACTIVE-папки в ARCHIVE-папку.
      * Используем метод Drive API: POST /files/{fileId}/copy
      */
@@ -280,14 +461,101 @@ class DriveRepository(
 
     /**
      * Удаление файла игры с Google Drive.
-     * Пока заглушка — фактическое удаление не реализовано.
+     *
+     * Ищем файл по имени (например, 2025-11-27_16-35-12_pestovo.json)
+     * в ACTIVE- и ARCHIVE-папках и удаляем все найденные.
      */
     suspend fun deleteGameFileOnDrive(
-        localFile: File?,
-        gameId: String
-    ) {
-        // TODO: реализовать удаление файла на Google Drive по gameId / имени / driveFileId
+        token: String,
+        gameId: String,
+        localFile: File?
+    ): DriveResult {
+        return try {
+            // Определяем имя файла: либо по локальному файлу, либо по gameId
+            val targetFileName = localFile?.name ?: "$gameId.json"
+
+            var deletedCount = 0
+            var errors = 0
+
+            fun deleteInFolder(folderId: String) {
+                if (folderId.isBlank()) return
+
+                // 1) находим файлы с нужным именем в указанной папке
+                val query = URLEncoder.encode(
+                    "'$folderId' in parents and name = '$targetFileName' and trashed = false",
+                    "UTF-8"
+                )
+
+                val listUrl = URL(
+                    "https://www.googleapis.com/drive/v3/files?q=$query&fields=files(id,name)"
+                )
+
+                val listConn = (listUrl.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    setRequestProperty("Authorization", "Bearer $token")
+                    setRequestProperty("Accept", "application/json")
+                }
+
+                val listCode = listConn.responseCode
+                val listBody = readBody(listConn, listCode)
+
+                if (listCode !in 200..299) {
+                    errors++
+                    return
+                }
+
+                val filesArray = try {
+                    JSONObject(listBody ?: "{}").optJSONArray("files")
+                } catch (_: Exception) {
+                    null
+                } ?: return
+
+                // 2) удаляем все найденные файлы
+                for (i in 0 until filesArray.length()) {
+                    val obj = filesArray.optJSONObject(i) ?: continue
+                    val id = obj.optString("id", null) ?: continue
+
+                    val delUrl = URL("https://www.googleapis.com/drive/v3/files/$id")
+                    val delConn = (delUrl.openConnection() as HttpURLConnection).apply {
+                        requestMethod = "DELETE"
+                        setRequestProperty("Authorization", "Bearer $token")
+                    }
+
+                    val delCode = delConn.responseCode
+                    if (delCode in 200..299 || delCode == 204) {
+                        deletedCount++
+                    } else {
+                        errors++
+                    }
+                }
+            }
+
+            // Пытаемся удалить и из ACTIVE, и из ARCHIVE
+            deleteInFolder(activeFolderId)
+            deleteInFolder(archiveFolderId)
+
+            if (errors == 0) {
+                DriveResult(
+                    success = true,
+                    isUpdate = deletedCount > 0,
+                    errorMessage = null
+                )
+            } else {
+                DriveResult(
+                    success = deletedCount > 0,
+                    isUpdate = deletedCount > 0,
+                    errorMessage = "Удалено файлов: $deletedCount, ошибок: $errors"
+                )
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            DriveResult(
+                success = false,
+                errorMessage = "Ошибка при удалении с Google Drive: ${e.message}"
+            )
+        }
     }
+
 
     // --- утилита чтения тела ответа ---
     private fun readBody(conn: HttpURLConnection, code: Int): String? {

@@ -46,6 +46,9 @@ class MainActivity : ComponentActivity() {
         )
     }
 
+
+
+    /** Эта часть для теста*/
     companion object {
         /** Папка Google Drive для текущих (онлайн) игр */
         private const val DRIVE_ACTIVE_FOLDER_ID: String =
@@ -55,6 +58,22 @@ class MainActivity : ComponentActivity() {
         private const val DRIVE_ARCHIVE_FOLDER_ID: String =
             "1oCuj8Y_ygfbMhyKL1A8cgtWG-MneGyCI"
     }
+
+
+
+//    /** Эта часть для релиза*/
+//    companion object {
+//        /** Папка Google Drive для текущих (онлайн) игр */
+//        private const val DRIVE_ACTIVE_FOLDER_ID: String =
+//            "158ttYeax1ab_ilCUuROybr6G4ZUJ5dEP"
+//
+//        /** Папка Google Drive для архива завершённых игр */
+//        private const val DRIVE_ARCHIVE_FOLDER_ID: String =
+//            "1xXkAOtax1d_3H66XLFqFnfkLUSAYOIzz"
+//    }
+
+
+
 
     // ----- Google Sign-In -----
 
@@ -107,6 +126,35 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * Удаление игры с Google Drive по gameId / имени файла.
+     * Локальная БД и файл должны быть уже очищены.
+     */
+    private fun deleteGameOnDrive(gameId: String, file: File?) {
+        // Если Drive не подключён, можно просто тихо игнорировать
+        val account = GoogleSignIn.getLastSignedInAccount(this)
+        if (account == null) {
+            return
+        }
+
+        requestDriveToken { token ->
+            lifecycleScope.launch(Dispatchers.IO) {
+                val result = driveRepo.deleteGameFileOnDrive(token, gameId, file)
+
+                if (!result.success && result.errorMessage != null) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Не удалось удалить игру с Google Drive: ${result.errorMessage}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                }
+            }
+        }
+    }
+
+
     // Загрузка игры на Drive (обёртка над репозиторием)
     private fun uploadGame(file: File, isFinal: Boolean) {
         requestDriveToken { token ->
@@ -147,6 +195,68 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+
+    /**
+     * Ручная проверка и дозагрузка всех игр в архивную папку на Google Drive.
+     *
+     * Алгоритм:
+     *  - берём все GameEntry из локальной БД;
+     *  - для каждой записи проверяем наличие локального файла;
+     *  - через DriveRepository.ensureGameInArchive() гарантируем наличие архива на Drive;
+     *  - по итогам показываем сводный Toast.
+     */
+    private fun syncAllGamesWithDrive() {
+        requestDriveToken { token ->
+            lifecycleScope.launch(Dispatchers.IO) {
+                val allGames = gameDb.gameDao().getAllGames()
+
+                var alreadyOnDrive = 0
+                var uploaded = 0
+                var missingLocal = 0
+                var failed = 0
+
+                allGames.forEach { entry ->
+                    val path = entry.localPath
+                    if (path.isNullOrBlank()) {
+                        missingLocal++
+                        return@forEach
+                    }
+
+                    val file = File(path)
+                    if (!file.exists()) {
+                        missingLocal++
+                        return@forEach
+                    }
+
+                    val result = driveRepo.ensureGameInArchive(token, file)
+                    if (result.success) {
+                        if (result.isUpdate) {
+                            // файл уже был в архивной папке
+                            alreadyOnDrive++
+                        } else {
+                            // файл дозагружен
+                            uploaded++
+                        }
+                    } else {
+                        failed++
+                    }
+                }
+
+                withContext(Dispatchers.Main) {
+                    val msg = buildString {
+                        append("Синхронизация завершена.\n")
+                        append("Всего игр в списке: ${allGames.size}.\n")
+                        append("На Диске уже было: $alreadyOnDrive.\n")
+                        append("Дозагружено: $uploaded.\n")
+                        append("Без локального файла: $missingLocal.\n")
+                        append("С ошибками: $failed.")
+                    }
+                    Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
+                }
+            }
+        }
+    }
+
 
     // Авторизация в Google — UI-триггер
     private val googleSignInLauncher =
@@ -230,7 +340,7 @@ class MainActivity : ComponentActivity() {
                             }
                         },
                         onGameDeleted = { gameId, file ->
-                            lifecycleScope.launch {
+                            lifecycleScope.launch(Dispatchers.IO) {
                                 // 1. удалить запись из Room
                                 gameDb.gameDao().deleteGameById(gameId)
 
@@ -239,12 +349,12 @@ class MainActivity : ComponentActivity() {
                                     if (it.exists()) it.delete()
                                 }
 
-                                // 3. удалить файл на Google Drive
-                                driveRepository.deleteGameFileOnDrive(
-                                    localFile = file,
-                                    gameId = gameId
-                                )
+                                // 3. удалить файл на Google Drive (в отдельном helper-е)
+                                deleteGameOnDrive(gameId, file)
                             }
+                        },
+                        onSyncWithDrive = {
+                            syncAllGamesWithDrive()
                         }
                     )
                 }
