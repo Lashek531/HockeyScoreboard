@@ -69,6 +69,18 @@ class RaspiRepository {
     fun uploadDebugJson(json: String): RaspiResult =
         postJson("/api/upload-json", json)
 
+    /** Удаление завершённой игры на сервере – finished/<season>/<id>.json */
+    fun deleteFinishedGame(season: String, gameId: String): RaspiResult {
+        val body = """
+        {
+          "season": "$season",
+          "id": "$gameId"
+        }
+    """.trimIndent()
+
+        return postJson("/api/delete-finished-game", body)
+    }
+
     // --- Базовый HTTP-клиент ---
 
     private fun postJson(path: String, body: String): RaspiResult {

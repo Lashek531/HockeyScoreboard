@@ -19,4 +19,7 @@ interface GameDao {
 
     @Query("DELETE FROM games")
     fun deleteAll()
+
+    @Query("SELECT * FROM games WHERE gameId = :gameId LIMIT 1")
+    fun getGameById(gameId: String): GameEntry?
 }

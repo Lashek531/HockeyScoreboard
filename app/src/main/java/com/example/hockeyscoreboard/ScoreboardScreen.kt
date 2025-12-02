@@ -3,7 +3,6 @@ package com.example.hockeyscoreboard
 import android.content.Context
 import android.content.Intent
 import android.widget.Toast
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
@@ -38,14 +37,22 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
-import com.example.hockeyscoreboard.data.syncGamesFolderToRoom
-import com.example.hockeyscoreboard.data.rebuildGamesIndexFromAllSources
 import com.example.hockeyscoreboard.data.getSeasonFinishedDir
 import com.example.hockeyscoreboard.data.getCurrentSeason
 import com.example.hockeyscoreboard.data.setCurrentSeason
 
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.ui.platform.LocalContext
+import kotlinx.coroutines.launch
 
-
+import com.example.hockeyscoreboard.data.SettingsRepositoryImpl
+import com.example.hockeyscoreboard.data.SyncRepository
+import com.example.hockeyscoreboard.data.SyncResult
 
 
 // --- Цвета для всплывающих окон в общем стиле ---
@@ -68,41 +75,32 @@ private fun dialogDangerButtonColors() = ButtonDefaults.textButtonColors(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ScoreboardScreen(
-    driveAccountEmail: String? = null,
-    onConnectDrive: () -> Unit = {},
     onGameSaved: (File) -> Unit = {},
     onGameJsonUpdated: (File) -> Unit = {},
     onNewGameStarted: () -> Unit = {},
-    onGameDeleted: (gameId: String, file: File?) -> Unit = { _, _ -> },
-    onSyncWithDrive: () -> Unit = {}
-
-
+    onGameDeleted: (gameId: String, file: File?) -> Unit = { _, _ -> }
 ) {
     val context = LocalContext.current
     val prefs = remember {
         context.getSharedPreferences("hockey_prefs", Context.MODE_PRIVATE)
     }
-    // Текущий сезон — храним в настройках, отображаем и используем в логике
+
+    // Текущий сезон
     var currentSeason by remember {
         mutableStateOf(getCurrentSeason(context))
     }
 
-
-    // --- Локальная БД для индекса игр ---
+    // Локальная БД для индекса игр
     val gameDb = remember { GameDatabase.getInstance(context) }
     val gameDao = remember { gameDb.gameDao() }
 
-    // --- БАЗОВЫЙ СПИСОК ИГРОКОВ (имена + роль + рейтинг) ---
-
+    // БАЗОВЫЙ СПИСОК ИГРОКОВ
     var basePlayers by remember {
         mutableStateOf(loadBasePlayers(prefs))
     }
-
-    // Имя для добавления нового игрока
     var newPlayerName by remember { mutableStateOf("") }
 
-    // --- СОСТАВЫ КОМАНД ---
-
+    // СОСТАВЫ КОМАНД
     var playersRedText by rememberSaveable { mutableStateOf("") }
     var playersWhiteText by rememberSaveable { mutableStateOf("") }
 
@@ -120,8 +118,7 @@ fun ScoreboardScreen(
             .sorted()
     }
 
-    // --- ФЛАГИ ДИАЛОГОВ / МЕНЮ ---
-
+    // ФЛАГИ ДИАЛОГОВ / МЕНЮ
     var showBasePlayersDialog by remember { mutableStateOf(false) }
     var showLineupsDialog by remember { mutableStateOf(false) }
     var showHistoryDialog by remember { mutableStateOf(false) }
@@ -132,14 +129,7 @@ fun ScoreboardScreen(
     var showNoTeamsDialog by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
 
-
-    // новые окна статистики
-    var showTopScorersDialog by remember { mutableStateOf(false) }
-    var showTopBombersDialog by remember { mutableStateOf(false) }
-    var topScorersRows by remember { mutableStateOf<List<PlayerStatsRow>>(emptyList()) }
-    var topBombersRows by remember { mutableStateOf<List<PlayerStatsRow>>(emptyList()) }
-
-    // текущая выбранная игра (из БД) и её файл
+    // Текущая выбранная игра (для истории)
     var historySelectedEntry by remember { mutableStateOf<GameEntry?>(null) }
     var historySelectedFile by remember { mutableStateOf<File?>(null) }
     var historyDetailsText by remember { mutableStateOf("") }
@@ -147,33 +137,29 @@ fun ScoreboardScreen(
     // подтверждение удаления сохранённой игры
     var showDeleteGameConfirm by remember { mutableStateOf(false) }
 
-    // --- ИГРА / ГОЛЫ / ПРОТОКОЛ ---
-
+    // ИГРА / ГОЛЫ / ПРОТОКОЛ
     var goals by rememberSaveable(stateSaver = GoalEventListSaver) {
         mutableStateOf(listOf<GoalEvent>())
     }
 
-    // Протокол изменений составов по ходу матча
     var rosterChanges by rememberSaveable(stateSaver = RosterChangeEventListSaver) {
         mutableStateOf(listOf<RosterChangeEvent>())
     }
 
     var nextGoalId by rememberSaveable { mutableStateOf(1L) }
     var nextRosterChangeId by rememberSaveable { mutableStateOf(1L) }
-
-    // Общий счётчик порядка событий (голы + изменения составов)
     var nextEventOrder by rememberSaveable { mutableStateOf(1L) }
+
     // Время старта текущей игры (для стабильного gameId / имени файла)
     var gameStartMillis by rememberSaveable { mutableStateOf<Long?>(null) }
 
     val redScore = goals.count { it.team == Team.RED }
     val whiteScore = goals.count { it.team == Team.WHITE }
+
     // Снапшоты составов на момент открытия диалога "Составы команд"
     var lastLineupsRedSnapshot by remember { mutableStateOf<List<String>>(emptyList()) }
     var lastLineupsWhiteSnapshot by remember { mutableStateOf<List<String>>(emptyList()) }
-    // Базовые составы зафиксированы (первое сохранение — только база, без событий)
     var hasBaselineLineups by rememberSaveable { mutableStateOf(false) }
-
 
     var goalInputTeam by remember { mutableStateOf<Team?>(null) }
     var editingGoalId by remember { mutableStateOf<Long?>(null) }
@@ -196,6 +182,7 @@ fun ScoreboardScreen(
     }
 
     fun resetGameState() {
+        // сбрасываем голы и протокол
         goals = emptyList()
         rosterChanges = emptyList()
         nextGoalId = 1L
@@ -204,6 +191,11 @@ fun ScoreboardScreen(
         gameFinished = false
         gameStartMillis = null
 
+        // сбрасываем составы команд (текстовые поля → пустые строки)
+        playersRedText = ""
+        playersWhiteText = ""
+
+        // очищаем снапшоты составов
         lastLineupsRedSnapshot = emptyList()
         lastLineupsWhiteSnapshot = emptyList()
         hasBaselineLineups = false
@@ -214,7 +206,7 @@ fun ScoreboardScreen(
 
 
     fun logRosterChangesFromDialog() {
-        // Первый вызов: просто фиксируем базовый состав, но НЕ создаём событий
+        // Первый вызов: фиксируем базовый состав, но без событий
         if (!hasBaselineLineups) {
             lastLineupsRedSnapshot = playersRed
             lastLineupsWhiteSnapshot = playersWhite
@@ -222,15 +214,12 @@ fun ScoreboardScreen(
             return
         }
 
-        // Все известные игроки
         val baseNames = basePlayers.map { it.name }.toSet()
 
-        // Состояние "до" (на момент открытия диалога)
         val beforeRed = lastLineupsRedSnapshot.toSet()
         val beforeWhite = lastLineupsWhiteSnapshot.toSet()
         val beforeNone = baseNames - beforeRed - beforeWhite
 
-        // Состояние "после" (на момент нажатия OK)
         val afterRed = playersRed.toSet()
         val afterWhite = playersWhite.toSet()
         val afterNone = baseNames - afterRed - afterWhite
@@ -263,11 +252,11 @@ fun ScoreboardScreen(
             }
         }
 
-        if (newEvents.isNotEmpty()) {
+        // Не добавляем переходы в протокол, пока в игре нет ни одного гола
+        if (goals.isNotEmpty() && newEvents.isNotEmpty()) {
             rosterChanges = rosterChanges + newEvents
         }
 
-        // Обновляем снапшоты на текущее состояние
         lastLineupsRedSnapshot = playersRed
         lastLineupsWhiteSnapshot = playersWhite
     }
@@ -304,22 +293,26 @@ fun ScoreboardScreen(
         val fileFormat = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.getDefault())
         val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
 
-        // Старт игры: фиксируем один раз и используем всегда
+        // Старт игры фиксируем один раз
         val startMillis = gameStartMillis ?: System.currentTimeMillis().also { gameStartMillis = it }
         val startDate = Date(startMillis)
 
-        val fileName = fileFormat.format(startDate) + "_pestovo.json"
+        val baseId = fileFormat.format(startDate) + "_pestovo"   // без .json
+        val fileName = "$baseId.json"
         val dateIso = isoFormat.format(startDate)
+
+        val season = currentSeason
 
         val root = org.json.JSONObject()
 
-        val currentSeason = currentSeason
+        // Два идентификатора, чтобы всем было хорошо:
+        root.put("id", baseId)          // то, что ждёт Raspi для finished/<season>/<id>.json
+        root.put("gameId", baseId)      // как и раньше внутри приложения
 
-        root.put("gameId", fileFormat.format(startDate) + "_pestovo")
         root.put("arena", "Пестово Арена")
         root.put("date", dateIso)
-        root.put("season", currentSeason)
-        root.put("finished", isFinal)   // флаг завершения игры
+        root.put("season", season)
+        root.put("finished", isFinal)
 
         val teamsObj = org.json.JSONObject()
         val redObj = org.json.JSONObject()
@@ -341,7 +334,6 @@ fun ScoreboardScreen(
 
         root.put("teams", teamsObj)
 
-        // Текущий счёт считаем по списку голов на момент вызова
         val currentRedScore = goals.count { it.team == Team.RED }
         val currentWhiteScore = goals.count { it.team == Team.WHITE }
 
@@ -354,7 +346,7 @@ fun ScoreboardScreen(
         var runningRed = 0
         var runningWhite = 0
 
-        goals.sortedBy { it.eventOrder }.forEachIndexed { index, goal ->
+        goals.sortedBy { it.eventOrder }.forEach { goal ->
             if (goal.team == Team.RED) runningRed++ else runningWhite++
             val goalObj = org.json.JSONObject()
             goalObj.put("team", goal.team.name)
@@ -368,9 +360,8 @@ fun ScoreboardScreen(
 
         root.put("goals", goalsArray)
 
-        // Изменения составов по ходу матча
         val rosterArray = org.json.JSONArray()
-        rosterChanges.sortedBy { it.eventOrder }.forEachIndexed { index, ev ->
+        rosterChanges.sortedBy { it.eventOrder }.forEach { ev ->
             val evObj = org.json.JSONObject()
             evObj.put("id", ev.id)
             evObj.put("player", ev.player)
@@ -381,22 +372,14 @@ fun ScoreboardScreen(
         }
         root.put("rosterChanges", rosterArray)
 
-
-        return fileName to root.toString(2)
-
-
         return fileName to root.toString(2)
     }
 
-    /**
-     * Реально сохраняем JSON в файл и возвращаем File.
-     * Тот же файл используем и для Drive, и для локальной истории.
-     */
     fun saveGameJsonToFile(isFinal: Boolean = false): File {
         val (fileName, json) = buildGameJson(isFinal)
 
-        val currentSeason = currentSeason
-        val dir = getSeasonFinishedDir(context, currentSeason)
+        val seasonLocal = currentSeason
+        val dir = getSeasonFinishedDir(context, seasonLocal)
         if (!dir.exists()) dir.mkdirs()
 
         val file = File(dir, fileName)
@@ -404,30 +387,25 @@ fun ScoreboardScreen(
         return file
     }
 
-
     /**
-     * Общая точка: любое обновление игры.
+     * Любое обновление игры.
      * 1) сохраняем JSON,
      * 2) обновляем запись в Room,
-     * 3) отправляем наружу на Drive.
+     * 3) уведомляем наружу (MainActivity решает, что делать дальше).
      */
     fun notifyGameJsonUpdated(isFinal: Boolean = false) {
-        // 1. сохраняем JSON на диск
         val file = saveGameJsonToFile(isFinal)
 
-
-
-        // 2. обновляем индекс игры в локальной БД
         val now = System.currentTimeMillis()
         val finishedAt = if (isFinal) now else null
         val startedAt = gameStartMillis ?: now
         val gameId = file.name.removeSuffix(".json")
-        val season = currentSeason
+        val seasonLocal = currentSeason
 
         val entry = GameEntry(
             gameId = gameId,
             fileName = file.name,
-            season = season,
+            season = seasonLocal,
             localPath = file.absolutePath,
             startedAt = startedAt,
             finishedAt = finishedAt,
@@ -436,7 +414,6 @@ fun ScoreboardScreen(
         )
         gameDao.upsertGame(entry)
 
-        // 3. уведомляем наружу – что делать с этим файлом
         if (isFinal) {
             onGameSaved(file)
         } else {
@@ -449,10 +426,8 @@ fun ScoreboardScreen(
         val team = goalInputTeam ?: return
         val scorer = tempScorer ?: return
 
-        // id гола
         val id = editingGoalId ?: nextGoalId++
 
-        // если редактируем, сохраняем старый order, иначе выдаём новый
         val existingOrder = goals.find { it.id == id }?.eventOrder
         val order = existingOrder ?: nextEventOrder++
 
@@ -471,9 +446,7 @@ fun ScoreboardScreen(
             goals.map { if (it.id == editingGoalId) newEvent else it }
         }
 
-        // после любого изменения списка голов шлём обновлённый JSON
         notifyGameJsonUpdated(isFinal = false)
-
         resetGoalInput()
     }
 
@@ -489,7 +462,6 @@ fun ScoreboardScreen(
         }
     }
 
-    // Экспорт JSON-файла сохранённого матча через системный Share Sheet
     fun exportGameFile(context: Context, file: File) {
         try {
             val uri = FileProvider.getUriForFile(
@@ -540,7 +512,7 @@ fun ScoreboardScreen(
         }
     }
 
-    // --- ОСНОВНОЙ ЭКРАН: Scaffold + AppBar + FAB ---
+    // --- ОСНОВНОЙ ЭКРАН ---
 
     Scaffold(
         topBar = {
@@ -549,25 +521,6 @@ fun ScoreboardScreen(
                     Text(
                         text = "Пестово Арена",
                         style = MaterialTheme.typography.titleLarge
-                    )
-                },
-                actions = {
-                    Icon(
-                        imageVector = if (driveAccountEmail != null)
-                            Icons.Filled.Share
-                        else
-                            Icons.Filled.Close,
-                        contentDescription = if (driveAccountEmail != null)
-                            "Google Drive подключён"
-                        else
-                            "Google Drive не подключён",
-                        tint = if (driveAccountEmail != null)
-                            Color(0xFF81C784)
-                        else
-                            Color(0xFFB0BEC5),
-                        modifier = Modifier
-                            .padding(end = 8.dp)
-                            .size(24.dp)
                     )
                 },
                 colors = TopAppBarDefaults.centerAlignedTopAppBarColors(
@@ -603,8 +556,6 @@ fun ScoreboardScreen(
         )
     }
 
-    // --- Дальше все диалоги ---
-
     // --- ДИАЛОГ: МЕНЮ ДЕЙСТВИЙ ---
 
     if (showActionsMenu) {
@@ -617,23 +568,10 @@ fun ScoreboardScreen(
                         .fillMaxWidth()
                         .verticalScroll(rememberScrollState())
                 ) {
-                    // Статус Google Drive
-                    Text(
-                        text = if (driveAccountEmail != null)
-                            "Google Drive: подключено (${driveAccountEmail})"
-                        else
-                            "Google Drive: не подключено",
-                        fontSize = 14.sp,
-                        color = DialogTextColor,
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
-
-
                     TextButton(
                         onClick = {
                             showActionsMenu = false
                             if (!gameFinished) {
-                                // запоминаем составы перед редактированием
                                 lastLineupsRedSnapshot = playersRed
                                 lastLineupsWhiteSnapshot = playersWhite
                                 showLineupsDialog = true
@@ -644,7 +582,6 @@ fun ScoreboardScreen(
                     ) {
                         Text("Составы команд", fontSize = 16.sp)
                     }
-
 
                     TextButton(
                         onClick = {
@@ -658,32 +595,6 @@ fun ScoreboardScreen(
                         colors = dialogButtonColors()
                     ) {
                         Text("Завершённые игры", fontSize = 16.sp)
-                    }
-
-
-
-                    TextButton(
-                        onClick = {
-                            showActionsMenu = false
-                            val stats = collectPlayerStats(context)
-                            topScorersRows = buildTopScorersRows(stats)
-                            showTopScorersDialog = true
-                        },
-                        colors = dialogButtonColors()
-                    ) {
-                        Text("Лучшие снайперы", fontSize = 16.sp)
-                    }
-
-                    TextButton(
-                        onClick = {
-                            showActionsMenu = false
-                            val stats = collectPlayerStats(context)
-                            topBombersRows = buildTopBombersRows(stats)
-                            showTopBombersDialog = true
-                        },
-                        colors = dialogButtonColors()
-                    ) {
-                        Text("Лучшие бомбардиры", fontSize = 16.sp)
                     }
 
                     TextButton(
@@ -718,7 +629,6 @@ fun ScoreboardScreen(
                     ) {
                         Text("Настройки", fontSize = 16.sp)
                     }
-
                 }
             },
             confirmButton = {
@@ -748,7 +658,6 @@ fun ScoreboardScreen(
                         .heightIn(min = 200.dp, max = 500.dp)
                         .verticalScroll(rememberScrollState())
                 ) {
-                    // Добавление нового игрока
                     Row(
                         modifier = Modifier
                             .fillMaxWidth()
@@ -789,7 +698,6 @@ fun ScoreboardScreen(
 
                     Spacer(modifier = Modifier.height(4.dp))
 
-                    // Список игроков
                     basePlayers
                         .sortedBy { it.name }
                         .forEach { player ->
@@ -799,7 +707,6 @@ fun ScoreboardScreen(
                                     .padding(vertical = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                // Имя
                                 Text(
                                     text = player.name,
                                     modifier = Modifier.weight(1f),
@@ -809,7 +716,6 @@ fun ScoreboardScreen(
                                     fontSize = 16.sp
                                 )
 
-                                // Иконка амплуа (эмодзи)
                                 val roleSymbol = when (player.role) {
                                     PlayerRole.DEFENDER -> "🛡"
                                     PlayerRole.FORWARD -> "🎯"
@@ -839,7 +745,6 @@ fun ScoreboardScreen(
                                     Text(roleSymbol, fontSize = 14.sp)
                                 }
 
-                                // Рейтинг – маленькое поле без рамки
                                 var ratingText by remember(player.name) {
                                     mutableStateOf(
                                         if (player.rating == 0) "" else player.rating.toString()
@@ -943,18 +848,6 @@ fun ScoreboardScreen(
                         .fillMaxWidth()
                         .verticalScroll(rememberScrollState())
                 ) {
-                    // Статус Google Drive
-                    Text(
-                        text = if (driveAccountEmail != null)
-                            "Google Drive: подключено (${driveAccountEmail})"
-                        else
-                            "Google Drive: не подключено",
-                        fontSize = 14.sp,
-                        color = DialogTextColor,
-                        modifier = Modifier.padding(bottom = 8.dp)
-                    )
-
-                    // Текущий сезон
                     OutlinedTextField(
                         value = currentSeason,
                         onValueChange = { value ->
@@ -974,8 +867,6 @@ fun ScoreboardScreen(
                         )
                     )
 
-
-                    // Базовый список игроков
                     TextButton(
                         onClick = {
                             showSettingsDialog = false
@@ -988,103 +879,11 @@ fun ScoreboardScreen(
                     ) {
                         Text("Базовый список игроков", fontSize = 16.sp)
                     }
-
-                    // Сканировать папку игр
-                    TextButton(
-                        onClick = {
-                            showSettingsDialog = false
-                            val added = syncGamesFolderToRoom(context, gameDao)
-                            Toast.makeText(
-                                context,
-                                if (added > 0)
-                                    "Добавлено игр в список: $added"
-                                else
-                                    "Новых игр в папке не найдено",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        },
-                        colors = dialogButtonColors()
-                    ) {
-                        Text("Сканировать папку игр", fontSize = 16.sp)
-                    }
-
-                    // Проверить и синхронизировать с Google Диском
-                    TextButton(
-                        onClick = {
-                            showSettingsDialog = false
-                            onSyncWithDrive()
-                        },
-                        colors = dialogButtonColors()
-                    ) {
-                        Text("Проверить и синхронизировать с Google Диском", fontSize = 16.sp)
-                    }
-
-                    // Сканировать папку игр
-                    TextButton(
-                        onClick = {
-                            showSettingsDialog = false
-                            val added = syncGamesFolderToRoom(context, gameDao)
-                            Toast.makeText(
-                                context,
-                                if (added > 0)
-                                    "Добавлено игр в список: $added"
-                                else
-                                    "Новых игр в папке не найдено",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        },
-                        colors = dialogButtonColors()
-                    ) {
-                        Text("Сканировать папку игр", fontSize = 16.sp)
-                    }
-
-                    // Полная пересборка базы из всех файлов
-                    TextButton(
-                        onClick = {
-                            showSettingsDialog = false
-                            val total = rebuildGamesIndexFromAllSources(context, gameDao)
-                            Toast.makeText(
-                                context,
-                                if (total > 0)
-                                    "База пересобрана, игр в списке: $total"
-                                else
-                                    "JSON-файлы игр не найдены",
-                                Toast.LENGTH_LONG
-                            ).show()
-                        },
-                        colors = dialogButtonColors()
-                    ) {
-                        Text("Пересобрать базу из файлов", fontSize = 16.sp)
-                    }
-
-                    // Проверить и синхронизировать с Google Диском
-                    TextButton(
-                        onClick = {
-                            showSettingsDialog = false
-                            onSyncWithDrive()
-                        },
-                        colors = dialogButtonColors()
-                    ) {
-                        Text("Проверить и синхронизировать с Google Диском", fontSize = 16.sp)
-                    }
-
-
-                    // Подключить Google Drive
-                    TextButton(
-                        onClick = {
-                            showSettingsDialog = false
-                            onConnectDrive()
-                        },
-                        colors = dialogButtonColors()
-                    ) {
-                        Text("Подключить Google Drive", fontSize = 16.sp)
-                    }
                 }
             },
             confirmButton = {
                 TextButton(
                     onClick = {
-                        // сохраняем выбранный сезон в настройки
                         setCurrentSeason(context, currentSeason)
                         showSettingsDialog = false
                     },
@@ -1093,13 +892,11 @@ fun ScoreboardScreen(
                     Text("Закрыть", fontSize = 16.sp)
                 }
             },
-
             containerColor = DialogBackground,
             titleContentColor = DialogTitleColor,
             textContentColor = DialogTextColor
         )
     }
-
 
     // --- ДИАЛОГ: СОСТАВЫ КОМАНД ---
 
@@ -1116,7 +913,6 @@ fun ScoreboardScreen(
                         .fillMaxWidth()
                         .verticalScroll(rememberScrollState())
                 ) {
-                    // Красные
                     Text(
                         text = "Красные:",
                         fontWeight = FontWeight.SemiBold,
@@ -1167,7 +963,6 @@ fun ScoreboardScreen(
 
                     Spacer(modifier = Modifier.height(12.dp))
 
-                    // Белые
                     Text(
                         text = "Белые:",
                         fontWeight = FontWeight.SemiBold,
@@ -1218,7 +1013,6 @@ fun ScoreboardScreen(
 
                     Spacer(modifier = Modifier.height(16.dp))
 
-                    // Базовый список: только свободные игроки
                     if (availablePlayers.isNotEmpty()) {
                         Text(
                             text = "Базовый список игроков:",
@@ -1309,9 +1103,7 @@ fun ScoreboardScreen(
                     onClick = {
                         showLineupsDialog = false
                         if (!gameFinished) {
-                            // сначала фиксируем изменения составов в протокол
                             logRosterChangesFromDialog()
-                            // потом обновляем JSON / Drive
                             notifyGameJsonUpdated(isFinal = false)
                         }
                     },
@@ -1320,8 +1112,6 @@ fun ScoreboardScreen(
                     Text("OK", fontSize = 16.sp)
                 }
             },
-
-
             dismissButton = {
                 TextButton(
                     onClick = { showLineupsDialog = false },
@@ -1335,7 +1125,6 @@ fun ScoreboardScreen(
             textContentColor = DialogTextColor
         )
     }
-
 
     // --- ДИАЛОГ: ВВОД / РЕДАКТИРОВАНИЕ ГОЛА ---
 
@@ -1419,7 +1208,7 @@ fun ScoreboardScreen(
         )
     }
 
-    // --- ДИАЛОГ: ОПЦИИ ДЛЯ КОНКРЕТНОГО ГОЛА ---
+    // --- ДИАЛОГ: ОПЦИИ КОНКРЕТНОГО ГОЛА ---
 
     if (goalOptionsFor != null && !gameFinished) {
         val goal = goalOptionsFor!!
@@ -1476,7 +1265,7 @@ fun ScoreboardScreen(
         )
     }
 
-    // --- ДИАЛОГ: ПРЕДУПРЕЖДЕНИЕ "НЕТ СОСТАВОВ" ---
+    // --- ДИАЛОГ: "НЕТ СОСТАВОВ" ---
 
     if (showNoTeamsDialog) {
         AlertDialog(
@@ -1503,7 +1292,7 @@ fun ScoreboardScreen(
         )
     }
 
-    // --- ДИАЛОГ: ПОДТВЕРЖДЕНИЕ ЗАВЕРШЕНИЯ ИГРЫ ---
+    // --- ДИАЛОГ: ЗАВЕРШЕНИЕ ИГРЫ ---
 
     if (showFinishConfirm && !gameFinished) {
         AlertDialog(
@@ -1520,9 +1309,7 @@ fun ScoreboardScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        // единая точка: JSON + Room + Drive (финально)
                         notifyGameJsonUpdated(isFinal = true)
-
                         gameFinished = true
                         showFinishConfirm = false
                         showLineupsDialog = false
@@ -1556,7 +1343,7 @@ fun ScoreboardScreen(
             title = { Text("Начать новую игру?", fontSize = 20.sp) },
             text = {
                 Text(
-                    text = "Счёт и список голов будут обнулены. Составы команд и сохранённые завершённые игры останутся.",
+                    text = "Счёт, список голов и составы команд будут сброшены.",
                     color = DialogTextColor,
                     fontSize = 16.sp
                 )
@@ -1564,7 +1351,14 @@ fun ScoreboardScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
+                        // 1. Сбросить локальное состояние (составы, голы, счёт, флаги)
                         resetGameState()
+
+                        // 2. Сразу же сформировать НОВЫЙ JSON и отправить как активную игру
+                        // (buildGameJson установит новый gameStartMillis и сделает файл для текущего сезона)
+                        notifyGameJsonUpdated(isFinal = false)
+
+                        // 3. Закрыть диалог и дать знать наружу (если MainActivity что-то делает дополнительно)
                         showNewGameConfirm = false
                         onNewGameStarted()
                     },
@@ -1681,7 +1475,7 @@ fun ScoreboardScreen(
         )
     }
 
-    // --- ДИАЛОГ: ПРОСМОТР ПРОТОКОЛА (+ УДАЛЕНИЕ / ЭКСПОРТ) ---
+    // --- ДИАЛОГ: ПРОТОКОЛ МАТЧА (+ УДАЛЕНИЕ / ЭКСПОРТ) ---
 
     if (showHistoryDetailsDialog) {
         AlertDialog(
@@ -1779,7 +1573,6 @@ fun ScoreboardScreen(
                         val file = historySelectedFile
 
                         if (entry != null) {
-                            // отдаем решение наверх: что делать с локальной БД, файлами и Drive
                             onGameDeleted(entry.gameId, file)
                         }
 
@@ -1795,7 +1588,6 @@ fun ScoreboardScreen(
                     Text("Да, удалить", fontSize = 16.sp)
                 }
             },
-
             dismissButton = {
                 TextButton(
                     onClick = {
@@ -1804,306 +1596,6 @@ fun ScoreboardScreen(
                     colors = dialogButtonColors()
                 ) {
                     Text("Отмена", fontSize = 16.sp)
-                }
-            },
-            containerColor = DialogBackground,
-            titleContentColor = DialogTitleColor,
-            textContentColor = DialogTextColor
-        )
-    }
-
-    // --- ДИАЛОГ: ЛУЧШИЕ СНАЙПЕРЫ ---
-
-    if (showTopScorersDialog) {
-        AlertDialog(
-            onDismissRequest = {
-                showTopScorersDialog = false
-                topScorersRows = emptyList()
-            },
-            title = { Text("Лучшие снайперы", fontSize = 20.sp) },
-            text = {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 200.dp, max = 500.dp)
-                        .verticalScroll(rememberScrollState())
-                ) {
-                    if (topScorersRows.isEmpty()) {
-                        Text(
-                            text = "Нет данных: в сохранённых матчах пока нет заброшенных шайб.",
-                            fontSize = 14.sp,
-                            color = DialogTextColor
-                        )
-                    } else {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(bottom = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                "#",
-                                modifier = Modifier.width(28.dp),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = DialogTitleColor
-                            )
-                            Text(
-                                "Игрок",
-                                modifier = Modifier.weight(1f),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = DialogTitleColor
-                            )
-                            Text(
-                                "И",
-                                modifier = Modifier.width(24.dp),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = DialogTitleColor,
-                                textAlign = TextAlign.Center
-                            )
-                            Text(
-                                "Г",
-                                modifier = Modifier.width(24.dp),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = DialogTitleColor,
-                                textAlign = TextAlign.Center
-                            )
-                            Text(
-                                "П",
-                                modifier = Modifier.width(24.dp),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = DialogTitleColor,
-                                textAlign = TextAlign.Center
-                            )
-                            Text(
-                                "О",
-                                modifier = Modifier.width(24.dp),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = DialogTitleColor,
-                                textAlign = TextAlign.Center
-                            )
-                        }
-
-                        Divider(color = Color(0xFF37474F))
-
-                        topScorersRows.forEach { row ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 2.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = row.rank.toString(),
-                                    modifier = Modifier.width(28.dp),
-                                    fontSize = 14.sp,
-                                    color = DialogTextColor
-                                )
-                                Text(
-                                    text = row.name,
-                                    modifier = Modifier.weight(1f),
-                                    fontSize = 14.sp,
-                                    color = DialogTextColor,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Text(
-                                    text = row.games.toString(),
-                                    modifier = Modifier.width(24.dp),
-                                    fontSize = 14.sp,
-                                    color = DialogTextColor,
-                                    textAlign = TextAlign.Center
-                                )
-                                Text(
-                                    text = row.goals.toString(),
-                                    modifier = Modifier.width(24.dp),
-                                    fontSize = 14.sp,
-                                    color = DialogTextColor,
-                                    textAlign = TextAlign.Center
-                                )
-                                Text(
-                                    text = row.assists.toString(),
-                                    modifier = Modifier.width(24.dp),
-                                    fontSize = 14.sp,
-                                    color = DialogTextColor,
-                                    textAlign = TextAlign.Center
-                                )
-                                Text(
-                                    text = row.points.toString(),
-                                    modifier = Modifier.width(24.dp),
-                                    fontSize = 14.sp,
-                                    color = DialogTextColor,
-                                    textAlign = TextAlign.Center
-                                )
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showTopScorersDialog = false
-                        topScorersRows = emptyList()
-                    },
-                    colors = dialogButtonColors()
-                ) {
-                    Text("Закрыть", fontSize = 16.sp)
-                }
-            },
-            containerColor = DialogBackground,
-            titleContentColor = DialogTitleColor,
-            textContentColor = DialogTextColor
-        )
-    }
-
-    // --- ДИАЛОГ: ЛУЧШИЕ БОМБАРДИРЫ ---
-
-    if (showTopBombersDialog) {
-        AlertDialog(
-            onDismissRequest = {
-                showTopBombersDialog = false
-                topBombersRows = emptyList()
-            },
-            title = { Text("Лучшие бомбардиры", fontSize = 20.sp) },
-            text = {
-                Column(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 200.dp, max = 500.dp)
-                        .verticalScroll(rememberScrollState())
-                ) {
-                    if (topBombersRows.isEmpty()) {
-                        Text(
-                            text = "Нет данных: в сохранённых матчах пока нет набранных очков (голы + пасы).",
-                            fontSize = 14.sp,
-                            color = DialogTextColor
-                        )
-                    } else {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(bottom = 4.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Text(
-                                "#",
-                                modifier = Modifier.width(28.dp),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = DialogTitleColor
-                            )
-                            Text(
-                                "Игрок",
-                                modifier = Modifier.weight(1f),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = DialogTitleColor
-                            )
-                            Text(
-                                "И",
-                                modifier = Modifier.width(24.dp),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = DialogTitleColor,
-                                textAlign = TextAlign.Center
-                            )
-                            Text(
-                                "Г",
-                                modifier = Modifier.width(24.dp),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = DialogTitleColor,
-                                textAlign = TextAlign.Center
-                            )
-                            Text(
-                                "П",
-                                modifier = Modifier.width(24.dp),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = DialogTitleColor,
-                                textAlign = TextAlign.Center
-                            )
-                            Text(
-                                "О",
-                                modifier = Modifier.width(24.dp),
-                                fontSize = 14.sp,
-                                fontWeight = FontWeight.SemiBold,
-                                color = DialogTitleColor,
-                                textAlign = TextAlign.Center
-                            )
-                        }
-
-                        Divider(color = Color(0xFF37474F))
-
-                        topBombersRows.forEach { row ->
-                            Row(
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(vertical = 2.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = row.rank.toString(),
-                                    modifier = Modifier.width(28.dp),
-                                    fontSize = 14.sp,
-                                    color = DialogTextColor
-                                )
-                                Text(
-                                    text = row.name,
-                                    modifier = Modifier.weight(1f),
-                                    fontSize = 14.sp,
-                                    color = DialogTextColor,
-                                    maxLines = 1,
-                                    overflow = TextOverflow.Ellipsis
-                                )
-                                Text(
-                                    text = row.games.toString(),
-                                    modifier = Modifier.width(24.dp),
-                                    fontSize = 14.sp,
-                                    color = DialogTextColor,
-                                    textAlign = TextAlign.Center
-                                )
-                                Text(
-                                    text = row.goals.toString(),
-                                    modifier = Modifier.width(24.dp),
-                                    fontSize = 14.sp,
-                                    color = DialogTextColor,
-                                    textAlign = TextAlign.Center
-                                )
-                                Text(
-                                    text = row.assists.toString(),
-                                    modifier = Modifier.width(24.dp),
-                                    fontSize = 14.sp,
-                                    color = DialogTextColor,
-                                    textAlign = TextAlign.Center
-                                )
-                                Text(
-                                    text = row.points.toString(),
-                                    modifier = Modifier.width(24.dp),
-                                    fontSize = 14.sp,
-                                    color = DialogTextColor,
-                                    textAlign = TextAlign.Center
-                                )
-                            }
-                        }
-                    }
-                }
-            },
-            confirmButton = {
-                TextButton(
-                    onClick = {
-                        showTopBombersDialog = false
-                        topBombersRows = emptyList()
-                    },
-                    colors = dialogButtonColors()
-                ) {
-                    Text("Закрыть", fontSize = 16.sp)
                 }
             },
             containerColor = DialogBackground,
