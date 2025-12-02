@@ -11,14 +11,17 @@ import androidx.room.PrimaryKey
 @Entity(tableName = "games")
 data class GameEntry(
     @PrimaryKey
-    val gameId: String,      // например "2025-11-27_16-35-12_pestovo"
+    val gameId: String,      // по сути тот же id, который мы кладём в JSON
 
-    val fileName: String,    // "2025-11-27_16-35-12_pestovo.json"
-    val localPath: String?,  // абсолютный путь к файлу
+    val season: String,      // "25-26", "26-27", ...
 
-    val startedAt: Long,     // millis начала игры
-    val finishedAt: Long?,   // millis окончания (когда нажали "Завершить")
+    val fileName: String,
+    val localPath: String?,
+
+    val startedAt: Long,
+    val finishedAt: Long?,
 
     val redScore: Int,
     val whiteScore: Int
 )
+

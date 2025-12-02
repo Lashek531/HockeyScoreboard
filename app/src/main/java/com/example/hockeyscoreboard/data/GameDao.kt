@@ -16,4 +16,7 @@ interface GameDao {
 
     @Query("DELETE FROM games WHERE gameId = :gameId")
     fun deleteGameById(gameId: String)
+
+    @Query("DELETE FROM games")
+    fun deleteAll()
 }

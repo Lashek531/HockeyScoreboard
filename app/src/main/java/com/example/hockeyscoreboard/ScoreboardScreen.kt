@@ -39,6 +39,13 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import com.example.hockeyscoreboard.data.syncGamesFolderToRoom
+import com.example.hockeyscoreboard.data.rebuildGamesIndexFromAllSources
+import com.example.hockeyscoreboard.data.getSeasonFinishedDir
+import com.example.hockeyscoreboard.data.getCurrentSeason
+import com.example.hockeyscoreboard.data.setCurrentSeason
+
+
+
 
 
 // --- Цвета для всплывающих окон в общем стиле ---
@@ -75,6 +82,11 @@ fun ScoreboardScreen(
     val prefs = remember {
         context.getSharedPreferences("hockey_prefs", Context.MODE_PRIVATE)
     }
+    // Текущий сезон — храним в настройках, отображаем и используем в логике
+    var currentSeason by remember {
+        mutableStateOf(getCurrentSeason(context))
+    }
+
 
     // --- Локальная БД для индекса игр ---
     val gameDb = remember { GameDatabase.getInstance(context) }
@@ -301,9 +313,12 @@ fun ScoreboardScreen(
 
         val root = org.json.JSONObject()
 
+        val currentSeason = currentSeason
+
         root.put("gameId", fileFormat.format(startDate) + "_pestovo")
         root.put("arena", "Пестово Арена")
         root.put("date", dateIso)
+        root.put("season", currentSeason)
         root.put("finished", isFinal)   // флаг завершения игры
 
         val teamsObj = org.json.JSONObject()
@@ -380,13 +395,15 @@ fun ScoreboardScreen(
     fun saveGameJsonToFile(isFinal: Boolean = false): File {
         val (fileName, json) = buildGameJson(isFinal)
 
-        val dir = getGamesDir(context)
+        val currentSeason = currentSeason
+        val dir = getSeasonFinishedDir(context, currentSeason)
         if (!dir.exists()) dir.mkdirs()
 
         val file = File(dir, fileName)
         file.writeText(json, Charsets.UTF_8)
         return file
     }
+
 
     /**
      * Общая точка: любое обновление игры.
@@ -398,15 +415,19 @@ fun ScoreboardScreen(
         // 1. сохраняем JSON на диск
         val file = saveGameJsonToFile(isFinal)
 
+
+
         // 2. обновляем индекс игры в локальной БД
         val now = System.currentTimeMillis()
         val finishedAt = if (isFinal) now else null
         val startedAt = gameStartMillis ?: now
         val gameId = file.name.removeSuffix(".json")
+        val season = currentSeason
 
         val entry = GameEntry(
             gameId = gameId,
             fileName = file.name,
+            season = season,
             localPath = file.absolutePath,
             startedAt = startedAt,
             finishedAt = finishedAt,
@@ -933,6 +954,27 @@ fun ScoreboardScreen(
                         modifier = Modifier.padding(bottom = 8.dp)
                     )
 
+                    // Текущий сезон
+                    OutlinedTextField(
+                        value = currentSeason,
+                        onValueChange = { value ->
+                            currentSeason = value.trim()
+                        },
+                        label = { Text("Текущий сезон") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = DialogTitleColor,
+                            unfocusedTextColor = DialogTitleColor,
+                            cursorColor = DialogTitleColor,
+                            focusedBorderColor = Color(0xFF546E7A),
+                            unfocusedBorderColor = Color(0xFF455A64)
+                        )
+                    )
+
+
                     // Базовый список игроков
                     TextButton(
                         onClick = {
@@ -977,6 +1019,56 @@ fun ScoreboardScreen(
                         Text("Проверить и синхронизировать с Google Диском", fontSize = 16.sp)
                     }
 
+                    // Сканировать папку игр
+                    TextButton(
+                        onClick = {
+                            showSettingsDialog = false
+                            val added = syncGamesFolderToRoom(context, gameDao)
+                            Toast.makeText(
+                                context,
+                                if (added > 0)
+                                    "Добавлено игр в список: $added"
+                                else
+                                    "Новых игр в папке не найдено",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        },
+                        colors = dialogButtonColors()
+                    ) {
+                        Text("Сканировать папку игр", fontSize = 16.sp)
+                    }
+
+                    // Полная пересборка базы из всех файлов
+                    TextButton(
+                        onClick = {
+                            showSettingsDialog = false
+                            val total = rebuildGamesIndexFromAllSources(context, gameDao)
+                            Toast.makeText(
+                                context,
+                                if (total > 0)
+                                    "База пересобрана, игр в списке: $total"
+                                else
+                                    "JSON-файлы игр не найдены",
+                                Toast.LENGTH_LONG
+                            ).show()
+                        },
+                        colors = dialogButtonColors()
+                    ) {
+                        Text("Пересобрать базу из файлов", fontSize = 16.sp)
+                    }
+
+                    // Проверить и синхронизировать с Google Диском
+                    TextButton(
+                        onClick = {
+                            showSettingsDialog = false
+                            onSyncWithDrive()
+                        },
+                        colors = dialogButtonColors()
+                    ) {
+                        Text("Проверить и синхронизировать с Google Диском", fontSize = 16.sp)
+                    }
+
+
                     // Подключить Google Drive
                     TextButton(
                         onClick = {
@@ -991,12 +1083,17 @@ fun ScoreboardScreen(
             },
             confirmButton = {
                 TextButton(
-                    onClick = { showSettingsDialog = false },
+                    onClick = {
+                        // сохраняем выбранный сезон в настройки
+                        setCurrentSeason(context, currentSeason)
+                        showSettingsDialog = false
+                    },
                     colors = dialogButtonColors()
                 ) {
                     Text("Закрыть", fontSize = 16.sp)
                 }
             },
+
             containerColor = DialogBackground,
             titleContentColor = DialogTitleColor,
             textContentColor = DialogTextColor

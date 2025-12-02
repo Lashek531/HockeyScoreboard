@@ -12,6 +12,15 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 
 
+// Имя, которое нельзя учитывать в статистике (ошибочные значения)
+private fun isInvalidPlayerName(raw: String): Boolean {
+    val n = raw.trim()
+    if (n.isEmpty()) return true
+    val lower = n.lowercase(Locale.getDefault())
+    return lower == "null" || lower == "нул"
+}
+
+
 // Внутренние вспомогательные модели для разбора JSON протокола
 
 private data class GoalDecoded(
@@ -42,6 +51,16 @@ fun getGamesDir(context: Context): File {
     return File(baseDir, "games")
 }
 
+// Папка с файлами завершённых игр по сезонам:
+// .../Android/data/.../files/hockey-json/finished/<season>
+fun getSeasonFinishedDir(context: Context, season: String): File {
+    val baseDir = context.getExternalFilesDir(null)
+    val hockeyJsonDir = File(baseDir, "hockey-json")
+    val finishedDir = File(hockeyJsonDir, "finished")
+    return File(finishedDir, season)
+}
+
+
 // Список сохранённых игр (.json), отсортированный по дате (новые сверху)
 fun listSavedGames(context: Context): List<File> {
     val dir = getGamesDir(context)
@@ -50,6 +69,16 @@ fun listSavedGames(context: Context): List<File> {
         file.isFile && file.name.endsWith(".json", ignoreCase = true)
     }?.sortedByDescending { it.lastModified() } ?: emptyList()
 }
+
+// Список игр текущего сезона в папке hockey-json/finished/<season>
+fun listSeasonFinishedGames(context: Context, season: String): List<File> {
+    val dir = getSeasonFinishedDir(context, season)
+    if (!dir.exists() || !dir.isDirectory) return emptyList()
+    return dir.listFiles { file ->
+        file.isFile && file.name.endsWith(".json", ignoreCase = true)
+    }?.sortedByDescending { it.lastModified() } ?: emptyList()
+}
+
 
 // Чтение одного файла матча и формирование текста протокола
 fun loadHistoryDetails(file: File): String {
@@ -199,9 +228,16 @@ fun loadHistoryDetails(file: File): String {
 }
 
 // Сбор статистики по всем сохранённым играм
+// Сбор статистики по всем сохранённым играм
+// Сбор статистики по всем сохранённым играм
+// Сбор статистики по всем играм текущего сезона
+// Сбор статистики по всем играм текущего сезона
 fun collectPlayerStats(context: Context): Map<String, PlayerStats> {
     val result = mutableMapOf<String, PlayerStats>()
-    val files = listSavedGames(context)
+
+    val season = getCurrentSeason(context)
+    val files = listSeasonFinishedGames(context, season)
+
     for (file in files) {
         try {
             val text = file.readText(Charsets.UTF_8)
@@ -215,36 +251,46 @@ fun collectPlayerStats(context: Context): Map<String, PlayerStats> {
             val whitePlayersJson = whiteObj?.optJSONArray("players") ?: JSONArray()
 
             val playersInGame = mutableSetOf<String>()
+
+            // Игроки Красных
             for (i in 0 until redPlayersJson.length()) {
                 val name = redPlayersJson.optString(i).trim()
-                if (name.isNotEmpty()) playersInGame += name
+                if (!isInvalidPlayerName(name)) {
+                    playersInGame += name
+                }
             }
+            // Игроки Белых
             for (i in 0 until whitePlayersJson.length()) {
                 val name = whitePlayersJson.optString(i).trim()
-                if (name.isNotEmpty()) playersInGame += name
+                if (!isInvalidPlayerName(name)) {
+                    playersInGame += name
+                }
             }
 
+            // Каждому игроку, участвовавшему в матче, добавляем 1 игру
             for (name in playersInGame) {
                 val stats = result.getOrPut(name) { PlayerStats() }
                 stats.games++
             }
 
+            // Голы и передачи
             val goalsJson = root.optJSONArray("goals") ?: JSONArray()
             for (i in 0 until goalsJson.length()) {
                 val obj = goalsJson.optJSONObject(i)
+
                 val scorer = obj.optString("scorer", "").trim()
                 val a1 = obj.optString("assist1", "").trim()
                 val a2 = obj.optString("assist2", "").trim()
 
-                if (scorer.isNotEmpty()) {
+                if (!isInvalidPlayerName(scorer)) {
                     val stats = result.getOrPut(scorer) { PlayerStats() }
                     stats.goals++
                 }
-                if (a1.isNotEmpty()) {
+                if (!isInvalidPlayerName(a1)) {
                     val stats = result.getOrPut(a1) { PlayerStats() }
                     stats.assists++
                 }
-                if (a2.isNotEmpty()) {
+                if (!isInvalidPlayerName(a2)) {
                     val stats = result.getOrPut(a2) { PlayerStats() }
                     stats.assists++
                 }
@@ -253,6 +299,11 @@ fun collectPlayerStats(context: Context): Map<String, PlayerStats> {
             // пропускаем битый файл
         }
     }
+
+    // На всякий случай, чистим карту от мусорных ключей, если вдруг попали
+    val badKeys = result.keys.filter { isInvalidPlayerName(it) }
+    badKeys.forEach { result.remove(it) }
+
     return result
 }
 
@@ -331,8 +382,9 @@ fun syncGamesFolderToRoom(
             val gameId = root.optString(
                 "gameId",
                 file.name.removeSuffix(".json")
-            )
 
+            )
+            val season = root.optString("season", "25-26")
             // Дата начала игры
             val dateStr = root.optString("date", null)
             val startedAt = if (!dateStr.isNullOrBlank()) {
@@ -346,12 +398,14 @@ fun syncGamesFolderToRoom(
             }
 
             // Счёт из finalScore
+            // Счёт из finalScore
             val finalScoreObj = root.optJSONObject("finalScore")
             val redScore = finalScoreObj?.optInt("RED", 0) ?: 0
             val whiteScore = finalScoreObj?.optInt("WHITE", 0) ?: 0
 
             val entry = GameEntry(
                 gameId = gameId,
+                season = season,
                 fileName = file.name,
                 localPath = file.absolutePath,
                 startedAt = startedAt,
@@ -369,3 +423,160 @@ fun syncGamesFolderToRoom(
 
     return addedCount
 }
+/**
+ * Пытаемся вытащить сезон из пути к файлу, если в JSON поля season нет.
+ * Ищем кусок вида "25-26", "24-25" и т.п. в сегментах пути.
+ */
+private fun inferSeasonFromPath(file: File): String? {
+    val regex = Regex("""\d{2}-\d{2}""")
+    val segments = file.absolutePath.split(File.separatorChar, '/', '\\')
+    return segments.firstOrNull { regex.matches(it) }
+}
+
+/**
+ * Рекурсивно собираем все .json-файлы в указанной папке.
+ */
+private fun collectJsonFilesRecursively(root: File, out: MutableList<File>) {
+    if (!root.exists() || !root.isDirectory) return
+    val children = root.listFiles() ?: return
+    for (f in children) {
+        if (f.isDirectory) {
+            collectJsonFilesRecursively(f, out)
+        } else if (f.isFile && f.name.endsWith(".json", ignoreCase = true)) {
+            out += f
+        }
+    }
+}
+
+/**
+ * Преобразование одного JSON-файла матча в GameEntry для Room.
+ * Если файл битый или структура неожиданная — возвращаем null.
+ */
+private fun parseGameEntryFromJsonFile(file: File): GameEntry? {
+    val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
+
+    return try {
+        val text = file.readText(Charsets.UTF_8)
+        val root = JSONObject(text)
+
+        // gameId — из JSON или из имени файла без .json
+        val gameId = root.optString(
+            "gameId",
+            file.name.removeSuffix(".json")
+        )
+
+        // Сезон: сначала из JSON, если пусто — из пути, если и там нет — дефолт
+        val seasonFromJson = root.optString("season", "").trim()
+        val season = when {
+            seasonFromJson.isNotEmpty() -> seasonFromJson
+            inferSeasonFromPath(file) != null -> inferSeasonFromPath(file)!!
+            else -> "25-26"
+        }
+
+        // Дата начала игры
+        val dateStr = root.optString("date", null)
+        val startedAt = if (!dateStr.isNullOrBlank()) {
+            try {
+                isoFormat.parse(dateStr)?.time ?: file.lastModified()
+            } catch (_: Exception) {
+                file.lastModified()
+            }
+        } else {
+            file.lastModified()
+        }
+
+        // Счёт
+        val finalScoreObj = root.optJSONObject("finalScore")
+        val redScore = finalScoreObj?.optInt("RED", 0) ?: 0
+        val whiteScore = finalScoreObj?.optInt("WHITE", 0) ?: 0
+
+        // Опционально пытаемся прочитать finishedAt, если когда-нибудь появится в JSON
+        val finishedDateStr = root.optString("finishedAt", null)
+        val finishedAt = if (!finishedDateStr.isNullOrBlank()) {
+            try {
+                isoFormat.parse(finishedDateStr)?.time
+            } catch (_: Exception) {
+                null
+            }
+        } else {
+            null
+        }
+
+        GameEntry(
+            gameId = gameId,
+            season = season,
+            fileName = file.name,
+            localPath = file.absolutePath,
+            startedAt = startedAt,
+            finishedAt = finishedAt,
+            redScore = redScore,
+            whiteScore = whiteScore
+        )
+    } catch (_: Exception) {
+        null
+    }
+}
+
+/**
+ * Полная пересборка таблицы games по всем доступным JSON-файлам.
+ *
+ * 1. Очищает таблицу games.
+ * 2. Ищет файлы:
+ *    - в папке .../files/games
+ *    - в папке .../files/hockey-json/finished и всех её подпапках (по сезонам).
+ * 3. Для каждого файла читает JSON и создаёт GameEntry.
+ *
+ * Возвращает количество успешно импортированных игр.
+ */
+fun rebuildGamesIndexFromAllSources(
+    context: Context,
+    gameDao: GameDao
+): Int {
+    val baseDir = context.getExternalFilesDir(null) ?: return 0
+
+    // Старый формат: .../files/games
+    val legacyGamesDir = File(baseDir, "games")
+
+    // Новый формат: .../files/hockey-json/finished/<season>/<files.json>
+    val hockeyJsonFinishedRoot = File(File(baseDir, "hockey-json"), "finished")
+
+    val allFiles = mutableListOf<File>()
+
+    // 1) Добавляем json-ы из папки games (если есть)
+    if (legacyGamesDir.exists() && legacyGamesDir.isDirectory) {
+        val files = legacyGamesDir.listFiles { f ->
+            f.isFile && f.name.endsWith(".json", ignoreCase = true)
+        } ?: emptyArray()
+        allFiles += files
+    }
+
+    // 2) Добавляем json-ы из hockey-json/finished/** (все сезоны)
+    if (hockeyJsonFinishedRoot.exists() && hockeyJsonFinishedRoot.isDirectory) {
+        collectJsonFilesRecursively(hockeyJsonFinishedRoot, allFiles)
+    }
+
+    // Если файлов нет — просто очищаем таблицу и выходим
+    if (allFiles.isEmpty()) {
+        gameDao.deleteAll()
+        return 0
+    }
+
+    // Полностью чистим индекс игр
+    gameDao.deleteAll()
+
+    var imported = 0
+    val seenGameIds = mutableSetOf<String>()
+
+    for (file in allFiles) {
+        val entry = parseGameEntryFromJsonFile(file) ?: continue
+
+        // Если такой gameId уже встречался — дубль, пропускаем
+        if (!seenGameIds.add(entry.gameId)) continue
+
+        gameDao.upsertGame(entry)
+        imported++
+    }
+
+    return imported
+}
+

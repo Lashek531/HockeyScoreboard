@@ -14,6 +14,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import com.example.hockeyscoreboard.data.GameRepository
+import com.example.hockeyscoreboard.data.DriveRepository
+import com.example.hockeyscoreboard.data.RaspiRepository
+import com.example.hockeyscoreboard.data.db.GameDatabase
+import com.example.hockeyscoreboard.data.writeSeasonFinishedIndexFile
+import com.example.hockeyscoreboard.data.writeSeasonPlayersStatsFile
 import com.example.hockeyscoreboard.ui.theme.HockeyScoreboardTheme
 import com.google.android.gms.auth.GoogleAuthUtil
 import com.google.android.gms.auth.UserRecoverableAuthException
@@ -26,10 +31,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
-import com.example.hockeyscoreboard.data.db.GameDatabase
-import com.example.hockeyscoreboard.data.DriveRepository
-import androidx.lifecycle.lifecycleScope
-
+import kotlin.text.Charsets
 
 class MainActivity : ComponentActivity() {
 
@@ -38,17 +40,23 @@ class MainActivity : ComponentActivity() {
         GameDatabase.getInstance(this)
     }
 
-    // Репозиторий работы с Google Drive
-    private val driveRepository by lazy {
-        DriveRepository(
-            activeFolderId = DRIVE_ACTIVE_FOLDER_ID,
-            archiveFolderId = DRIVE_ARCHIVE_FOLDER_ID
-        )
+    // Репозиторий работы с Raspi (HTTP к Malina)
+    private val raspiRepo by lazy {
+        RaspiRepository()
     }
 
+    // ----- Google Drive -----
 
+    private lateinit var googleSignInClient: GoogleSignInClient
 
-    /** Эта часть для теста*/
+    // email аккаунта Drive (null = нет подключения)
+    private var driveAccountEmail by mutableStateOf<String?>(null)
+
+    // Репозитории
+    private lateinit var driveRepo: DriveRepository
+    private lateinit var gameRepo: GameRepository
+
+    /** Эта часть для теста */
     companion object {
         /** Папка Google Drive для текущих (онлайн) игр */
         private const val DRIVE_ACTIVE_FOLDER_ID: String =
@@ -57,11 +65,11 @@ class MainActivity : ComponentActivity() {
         /** Папка Google Drive для архива завершённых игр */
         private const val DRIVE_ARCHIVE_FOLDER_ID: String =
             "1oCuj8Y_ygfbMhyKL1A8cgtWG-MneGyCI"
+
+
     }
 
-
-
-//    /** Эта часть для релиза*/
+//    /** Эта часть для релиза */
 //    companion object {
 //        /** Папка Google Drive для текущих (онлайн) игр */
 //        private const val DRIVE_ACTIVE_FOLDER_ID: String =
@@ -72,19 +80,7 @@ class MainActivity : ComponentActivity() {
 //            "1xXkAOtax1d_3H66XLFqFnfkLUSAYOIzz"
 //    }
 
-
-
-
-    // ----- Google Sign-In -----
-
-    private lateinit var googleSignInClient: GoogleSignInClient
-
-    // email аккаунта Drive (null = нет подключения)
-    private var driveAccountEmail by mutableStateOf<String?>(null)
-
-    // Репозитории
-    private lateinit var driveRepo: DriveRepository
-    private lateinit var gameRepo: GameRepository
+    // ----- Google Sign-In / токен Drive -----
 
     // Единственная точка получения токена Drive
     private fun requestDriveToken(onReady: (String) -> Unit) {
@@ -96,7 +92,8 @@ class MainActivity : ComponentActivity() {
 
         val email = account.email
         if (email.isNullOrEmpty()) {
-            Toast.makeText(this, "Не удалось получить email аккаунта Google", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Не удалось получить email аккаунта Google", Toast.LENGTH_LONG)
+                .show()
             return
         }
 
@@ -131,11 +128,9 @@ class MainActivity : ComponentActivity() {
      * Локальная БД и файл должны быть уже очищены.
      */
     private fun deleteGameOnDrive(gameId: String, file: File?) {
-        // Если Drive не подключён, можно просто тихо игнорировать
+        // Если Drive не подключён, просто игнорируем
         val account = GoogleSignIn.getLastSignedInAccount(this)
-        if (account == null) {
-            return
-        }
+        if (account == null) return
 
         requestDriveToken { token ->
             lifecycleScope.launch(Dispatchers.IO) {
@@ -154,42 +149,29 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-
-    // Загрузка игры на Drive (обёртка над репозиторием)
+    // Загрузка игры на Drive (только архивный файл, без онлайн-обновлений)
     private fun uploadGame(file: File, isFinal: Boolean) {
+        // Онлайн-обновления на Google Drive больше не делаем
+        if (!isFinal) return
+
         requestDriveToken { token ->
             lifecycleScope.launch(Dispatchers.IO) {
-                val result = driveRepo.uploadFileWithToken(token, file, isFinal)
+                val result = driveRepo.ensureGameInArchive(token, file)
 
                 withContext(Dispatchers.Main) {
-                    when {
-                        result.success && isFinal ->
-                            Toast.makeText(
-                                this@MainActivity,
-                                "Игра сохранена и архивирована",
-                                Toast.LENGTH_LONG
-                            ).show()
-
-                        result.success && result.isUpdate ->
-                            Toast.makeText(
-                                this@MainActivity,
-                                "Игра обновлена в Google Drive",
-                                Toast.LENGTH_LONG
-                            ).show()
-
-                        result.success ->
-                            Toast.makeText(
-                                this@MainActivity,
-                                "Игра загружена в Google Drive",
-                                Toast.LENGTH_LONG
-                            ).show()
-
-                        else ->
-                            Toast.makeText(
-                                this@MainActivity,
-                                result.errorMessage ?: "Ошибка загрузки",
-                                Toast.LENGTH_LONG
-                            ).show()
+                    if (result.success) {
+                        val msg = if (result.isUpdate) {
+                            "Игра уже была в архиве Google Drive"
+                        } else {
+                            "Игра сохранена в архив Google Drive"
+                        }
+                        Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
+                    } else {
+                        Toast.makeText(
+                            this@MainActivity,
+                            result.errorMessage ?: "Ошибка загрузки в архив",
+                            Toast.LENGTH_LONG
+                        ).show()
                     }
                 }
             }
@@ -198,12 +180,6 @@ class MainActivity : ComponentActivity() {
 
     /**
      * Ручная проверка и дозагрузка всех игр в архивную папку на Google Drive.
-     *
-     * Алгоритм:
-     *  - берём все GameEntry из локальной БД;
-     *  - для каждой записи проверяем наличие локального файла;
-     *  - через DriveRepository.ensureGameInArchive() гарантируем наличие архива на Drive;
-     *  - по итогам показываем сводный Toast.
      */
     private fun syncAllGamesWithDrive() {
         requestDriveToken { token ->
@@ -231,10 +207,8 @@ class MainActivity : ComponentActivity() {
                     val result = driveRepo.ensureGameInArchive(token, file)
                     if (result.success) {
                         if (result.isUpdate) {
-                            // файл уже был в архивной папке
                             alreadyOnDrive++
                         } else {
-                            // файл дозагружен
                             uploaded++
                         }
                     } else {
@@ -256,7 +230,6 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
-
 
     // Авторизация в Google — UI-триггер
     private val googleSignInLauncher =
@@ -316,29 +289,92 @@ class MainActivity : ComponentActivity() {
                         driveAccountEmail = driveAccountEmail,
                         onConnectDrive = { startGoogleSignIn() },
 
-                        // Финальное сохранение игры
+                        // Финальное сохранение игры: Drive (архив) + Raspi
                         onGameSaved = { file ->
+                            // 1. Google Drive: финальное сохранение в архив
                             uploadGame(file, isFinal = true)
+
+                            // 2. Сезон и DAO
+                            val season = "25-26"   // пока жёстко, дальше вынесем в настройки
+                            val gameDao = gameDb.gameDao()
+
+                            // 3. В фоне: пересчёт сезонных файлов + отправка на Raspi
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                try {
+                                    // 3.1. Пересчитываем и сохраняем локально:
+                                    // finished/<season>/index.json
+                                    val finishedIndexFile = writeSeasonFinishedIndexFile(
+                                        context = this@MainActivity,
+                                        season = season,
+                                        gameDao = gameDao
+                                    )
+
+                                    // stats/<season>/players.json
+                                    val playersStatsFile = writeSeasonPlayersStatsFile(
+                                        context = this@MainActivity,
+                                        season = season,
+                                        gameDao = gameDao
+                                    )
+
+                                    // 3.2. Отправляем на Raspi сам json игры в архив
+                                    runCatching {
+                                        val gameJson = file.readText()
+                                        raspiRepo.uploadFinishedGame(gameJson)
+                                    }
+
+                                    // 3.3. Отправляем обновлённый finished-index
+                                    runCatching {
+                                        val idxJson = finishedIndexFile.readText()
+                                        raspiRepo.uploadFinishedIndex(idxJson)
+                                    }
+
+                                    // 3.4. Отправляем обновлённую статистику игроков
+                                    runCatching {
+                                        val statsJson = playersStatsFile.readText()
+                                        raspiRepo.uploadPlayersStats(statsJson)
+                                    }
+                                } catch (e: Exception) {
+                                    e.printStackTrace()
+                                    // при желании можно вывести тост на Main-потоке
+                                }
+                            }
                         },
 
-                        // Онлайн-обновление JSON при изменении счёта
+
+                        // Онлайн-обновление текущей игры: ТОЛЬКО Raspi, без Google Drive
                         onGameJsonUpdated = { file ->
-                            uploadGame(file, isFinal = false)
+                            lifecycleScope.launch(Dispatchers.IO) {
+                                val json = file.readText(Charsets.UTF_8)
+                                val res = raspiRepo.uploadActiveGame(json)
+
+                                if (!res.success && res.errorMessage != null) {
+                                    withContext(Dispatchers.Main) {
+                                        Toast.makeText(
+                                            this@MainActivity,
+                                            "Ошибка обновления Raspi: ${res.errorMessage}",
+                                            Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                }
+                            }
                         },
 
-                        // Начало новой игры → забываем старый Drive-файл
+                        // Начало новой игры
                         onNewGameStarted = {
-                            // 1. сброс локального указателя на текущий онлайн-файл
+                            // 1. сброс локального указателя на текущий онлайн-файл Drive
                             driveRepo.resetCurrentFile()
 
                             // 2. очистка онлайн-папки на Google Drive
                             requestDriveToken { token ->
                                 lifecycleScope.launch(Dispatchers.IO) {
                                     driveRepo.clearActiveFolder(token)
-                                    // без тостов, это фоновая операция
+                                    // без тостов, фоновая операция
                                 }
                             }
+
+                            // при необходимости сюда можно добавить логику очистки на Raspi
                         },
+
                         onGameDeleted = { gameId, file ->
                             lifecycleScope.launch(Dispatchers.IO) {
                                 // 1. удалить запись из Room
@@ -349,10 +385,13 @@ class MainActivity : ComponentActivity() {
                                     if (it.exists()) it.delete()
                                 }
 
-                                // 3. удалить файл на Google Drive (в отдельном helper-е)
+                                // 3. удалить файл на Google Drive
                                 deleteGameOnDrive(gameId, file)
+
+                                // Удаление на Raspi добавим позже, когда определимся с API
                             }
                         },
+
                         onSyncWithDrive = {
                             syncAllGamesWithDrive()
                         }
