@@ -81,6 +81,21 @@ fun ScoreboardScreen(
     onGameDeleted: (gameId: String, file: File?) -> Unit = { _, _ -> }
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+
+    val settingsRepository = remember { SettingsRepositoryImpl(context) }
+    val syncRepository = remember { SyncRepository(context, settingsRepository) }
+
+    var isSyncing by remember { mutableStateOf(false) }
+    var serverUrl by remember { mutableStateOf("") }
+    var apiKey by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) {
+        serverUrl = settingsRepository.getServerUrl()
+        apiKey = settingsRepository.getApiKey()
+    }
+
+
     val prefs = remember {
         context.getSharedPreferences("hockey_prefs", Context.MODE_PRIVATE)
     }
@@ -203,6 +218,81 @@ fun ScoreboardScreen(
         resetGoalInput()
         goalOptionsFor = null
     }
+
+
+
+    fun rebuildGamesIndexFromFilesystem() {
+        // база там же, где мы только что синкнули ZIP
+        val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+        val dbRoot = File(baseDir, "hockey-json")
+        val finishedRoot = File(dbRoot, "finished")
+
+        // если базы нет вообще — просто чистим индекс
+        if (!finishedRoot.exists() || !finishedRoot.isDirectory) {
+            gameDao.deleteAll()
+            return
+        }
+
+        // сначала полностью очищаем индекс
+        gameDao.deleteAll()
+
+        // проходим по всем сезонам: finished/<season>/*.json
+        finishedRoot.listFiles()?.forEach { seasonDir ->
+            if (!seasonDir.isDirectory) return@forEach
+            val season = seasonDir.name
+
+            seasonDir.listFiles { f ->
+                f.isFile &&
+                        f.name.endsWith(".json") &&
+                        f.name != "index.json"
+            }?.forEach { file ->
+                try {
+                    val text = file.readText(Charsets.UTF_8)
+                    val json = org.json.JSONObject(text)
+
+                    val baseId = json.optString(
+                        "id",
+                        file.name.removeSuffix(".json")
+                    )
+
+                    val dateStr = json.optString("date", "")
+                    val finalScoreObj = json.optJSONObject("finalScore")
+
+                    val redScore = finalScoreObj?.optInt("RED", 0) ?: 0
+                    val whiteScore = finalScoreObj?.optInt("WHITE", 0) ?: 0
+
+                    // пытаемся вытащить timestamp из поля date
+                    val startedAt = try {
+                        if (dateStr.isNotBlank()) {
+                            val fmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
+                            fmt.parse(dateStr)?.time ?: file.lastModified()
+                        } else {
+                            file.lastModified()
+                        }
+                    } catch (_: Exception) {
+                        file.lastModified()
+                    }
+
+                    val entry = GameEntry(
+                        gameId = baseId,
+                        season = season,
+                        fileName = file.name,
+                        localPath = file.absolutePath,
+                        startedAt = startedAt,
+                        finishedAt = startedAt,
+                        redScore = redScore,
+                        whiteScore = whiteScore
+                    )
+
+                    gameDao.upsertGame(entry)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    // на один кривой файл не падаем, просто пропускаем
+                }
+            }
+        }
+    }
+
 
 
     fun logRosterChangesFromDialog() {
@@ -867,6 +957,73 @@ fun ScoreboardScreen(
                         )
                     )
 
+                    OutlinedTextField(
+                        value = serverUrl,
+                        onValueChange = { serverUrl = it },
+                        label = { Text("URL сервера") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = DialogTitleColor,
+                            unfocusedTextColor = DialogTitleColor,
+                            cursorColor = DialogTitleColor,
+                            focusedBorderColor = Color(0xFF546E7A),
+                            unfocusedBorderColor = Color(0xFF455A64)
+                        )
+                    )
+
+                    OutlinedTextField(
+                        value = apiKey,
+                        onValueChange = { apiKey = it },
+                        label = { Text("API ключ") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = DialogTitleColor,
+                            unfocusedTextColor = DialogTitleColor,
+                            cursorColor = DialogTitleColor,
+                            focusedBorderColor = Color(0xFF546E7A),
+                            unfocusedBorderColor = Color(0xFF455A64)
+                        )
+                    )
+
+                    TextButton(
+                        onClick = {
+                            if (!isSyncing) {
+                                isSyncing = true
+                                scope.launch {
+                                    val result = syncRepository.syncDatabase()
+
+                                    if (result is SyncResult.Success) {
+                                        // Файлы обновлены – пересобираем индекс целиком
+                                        rebuildGamesIndexFromFilesystem()
+                                    }
+
+                                    val message = when (result) {
+                                        is SyncResult.Success -> "Синхронизация выполнена"
+                                        is SyncResult.Error -> "Ошибка синхронизации: ${result.message}"
+                                    }
+
+                                    Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                                }
+
+
+                            }
+                        },
+                        colors = dialogButtonColors(),
+                        enabled = !isSyncing
+                    ) {
+                        Text(
+                            if (isSyncing) "Синхронизация..." else "Синхронизировать базу",
+                            fontSize = 16.sp
+                        )
+                    }
+
+
                     TextButton(
                         onClick = {
                             showSettingsDialog = false
@@ -884,7 +1041,11 @@ fun ScoreboardScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        setCurrentSeason(context, currentSeason)
+                        scope.launch {
+                            setCurrentSeason(context, currentSeason)
+                            (settingsRepository as SettingsRepositoryImpl).setServerUrl(serverUrl)
+                            (settingsRepository as SettingsRepositoryImpl).setApiKey(apiKey)
+                        }
                         showSettingsDialog = false
                     },
                     colors = dialogButtonColors()
@@ -1384,11 +1545,10 @@ fun ScoreboardScreen(
     // --- ДИАЛОГ: СПИСОК ЗАВЕРШЁННЫХ ИГР ---
 
     if (showHistoryDialog) {
-        val savedGames = remember { gameDao.getAllGames() }
+        val  savedGames = gameDao.getAllGames()
 
         AlertDialog(
             onDismissRequest = {
-                showHistoryDialog = false
                 showHistoryDetailsDialog = false
                 historyDetailsText = ""
                 historySelectedEntry = null
@@ -1435,7 +1595,6 @@ fun ScoreboardScreen(
                                                 historySelectedEntry = entry
                                                 historySelectedFile = file
                                                 historyDetailsText = loadHistoryDetails(file)
-                                                showHistoryDialog = false
                                                 showHistoryDetailsDialog = true
                                             }
                                         }

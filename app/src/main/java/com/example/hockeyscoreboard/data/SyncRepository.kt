@@ -31,12 +31,19 @@ class SyncRepository(
     private val httpClient: OkHttpClient = OkHttpClient()
 ) {
 
+    // базовая директория там же, где лежат игры (Android/data/.../files)
+    private val baseDir: File
+        get() = context.getExternalFilesDir(null) ?: context.filesDir
+
+    // сюда должна попадать база hockey-json
     private val dbDir: File
-        get() = File(context.filesDir, "hockey-json")
+        get() = File(baseDir, "hockey-json")
 
+    // сюда временно распаковываем архив
     private val tmpRootDir: File
-        get() = File(context.filesDir, "hockey-json-tmp-root")
+        get() = File(baseDir, "hockey-json-tmp-root")
 
+    // ZIP можно продолжать хранить во внутреннем cacheDir
     private val tmpZipFile: File
         get() = File(context.cacheDir, "hockey-db.zip")
 
