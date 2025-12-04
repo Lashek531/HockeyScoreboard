@@ -13,7 +13,8 @@ enum class PlayerRole {
 data class PlayerInfo(
     val name: String,
     val role: PlayerRole = PlayerRole.UNIVERSAL,
-    val rating: Int = 0
+    val rating: Int = 0,
+    val userId: String? = null
 )
 
 // Команда
@@ -29,7 +30,8 @@ data class GoalEvent(
     val scorer: String,
     val assist1: String?,
     val assist2: String?,
-    val eventOrder: Long = 0L      // общий порядок события в матче
+    val eventOrder: Long = 0L,     // общий порядок события в матче
+    val timestampMillis: Long = System.currentTimeMillis()
 )
 
 // Сводная статистика игрока по всем сохранённым играм
@@ -58,12 +60,13 @@ val GoalEventListSaver: Saver<List<GoalEvent>, List<String>> =
         save = { list ->
             list.map { goal ->
                 listOf(
-                    goal.id.toString(),
-                    goal.team.name,
-                    goal.scorer,
-                    goal.assist1 ?: "",
-                    goal.assist2 ?: "",
-                    goal.eventOrder.toString()
+                    goal.id.toString(),              // 0
+                    goal.team.name,                 // 1
+                    goal.scorer,                    // 2
+                    goal.assist1 ?: "",             // 3
+                    goal.assist2 ?: "",             // 4
+                    goal.eventOrder.toString(),     // 5
+                    goal.timestampMillis.toString() // 6
                 ).joinToString("§")
             }
         },
@@ -71,6 +74,7 @@ val GoalEventListSaver: Saver<List<GoalEvent>, List<String>> =
             saved.mapIndexed { index, line ->
                 val parts = line.split("§")
                 val eventOrder = parts.getOrNull(5)?.toLongOrNull() ?: index.toLong()
+                val ts = parts.getOrNull(6)?.toLongOrNull() ?: System.currentTimeMillis()
 
                 GoalEvent(
                     id = parts[0].toLong(),
@@ -78,11 +82,13 @@ val GoalEventListSaver: Saver<List<GoalEvent>, List<String>> =
                     scorer = parts[2],
                     assist1 = parts.getOrNull(3)?.ifEmpty { null },
                     assist2 = parts.getOrNull(4)?.ifEmpty { null },
-                    eventOrder = eventOrder
+                    eventOrder = eventOrder,
+                    timestampMillis = ts
                 )
             }
         }
     )
+
 
 // Изменение состава по ходу матча
 data class RosterChangeEvent(

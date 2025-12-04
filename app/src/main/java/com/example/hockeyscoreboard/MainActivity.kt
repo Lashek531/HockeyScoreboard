@@ -1,5 +1,7 @@
 package com.example.hockeyscoreboard
 
+import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.os.Bundle
 import android.widget.Toast
 import androidx.activity.ComponentActivity
@@ -9,21 +11,153 @@ import androidx.compose.material3.Surface
 import androidx.compose.ui.Modifier
 import androidx.lifecycle.lifecycleScope
 import com.example.hockeyscoreboard.data.RaspiRepository
+import com.example.hockeyscoreboard.data.SettingsRepositoryImpl
 import com.example.hockeyscoreboard.data.db.GameDatabase
 import com.example.hockeyscoreboard.ui.theme.HockeyScoreboardTheme
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.DataOutputStream
 import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
 import kotlin.text.Charsets
 
 class MainActivity : ComponentActivity() {
 
+    // Репозиторий настроек — должен быть создан ПЕРВЫМ
+    private val settingsRepository by lazy { SettingsRepositoryImpl(this) }
+
+    // Репозиторий работы с Raspi (HTTP к серверу) — теперь зависит от settingsRepository
+    private val raspiRepo by lazy { RaspiRepository(settingsRepository) }
+
     // Локальная БД с играми
     private val gameDb by lazy { GameDatabase.getInstance(this) }
 
-    // Репозиторий работы с Raspi (HTTP к Malina)
-    private val raspiRepo by lazy { RaspiRepository() }
+
+    /** Снятие скриншота текущего экрана. */
+    private fun captureCurrentScreen(onBitmapReady: (Bitmap) -> Unit) {
+        val rootView = window.decorView.rootView
+
+        rootView.post {
+            val width = rootView.width
+            val height = rootView.height
+            if (width == 0 || height == 0) return@post
+
+            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+            val canvas = Canvas(bitmap)
+            rootView.draw(canvas)
+
+            onBitmapReady(bitmap)
+        }
+    }
+
+    /** Создание PNG и отправка в Telegram */
+    private fun takeAndSendScoreboardScreenshot() {
+        captureCurrentScreen { bitmap ->
+            lifecycleScope.launch {
+                val file = withContext(Dispatchers.IO) {
+                    val outFile = File(cacheDir, "scoreboard_${System.currentTimeMillis()}.png")
+                    outFile.outputStream().use { out ->
+                        bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+                    }
+                    outFile
+                }
+
+                sendScreenshotToTelegram(file)
+            }
+        }
+    }
+
+    /** Отправка PNG в Telegram */
+    private suspend fun sendScreenshotToTelegram(file: File) {
+        val token = settingsRepository.getTelegramBotToken().trim()
+        val chatId = settingsRepository.getTelegramChatId().trim()
+
+        if (token.isEmpty() || chatId.isEmpty()) {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(
+                    this@MainActivity,
+                    "Telegram не настроен (bot token / chat id)",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+            return
+        }
+
+        try {
+            withContext(Dispatchers.IO) {
+                val url = URL("https://api.telegram.org/bot$token/sendPhoto")
+                val boundary = "HSB-${System.currentTimeMillis()}"
+                val lineEnd = "\r\n"
+                val twoHyphens = "--"
+
+                val connection = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "POST"
+                    doInput = true
+                    doOutput = true
+                    useCaches = false
+                    setRequestProperty(
+                        "Content-Type",
+                        "multipart/form-data; boundary=$boundary"
+                    )
+                }
+
+                DataOutputStream(connection.outputStream).use { output ->
+
+                    // chat_id
+                    output.writeBytes(twoHyphens + boundary + lineEnd)
+                    output.writeBytes(
+                        "Content-Disposition: form-data; name=\"chat_id\"$lineEnd$lineEnd"
+                    )
+                    output.writeBytes(chatId + lineEnd)
+
+                    // Файл
+                    output.writeBytes(twoHyphens + boundary + lineEnd)
+                    output.writeBytes(
+                        "Content-Disposition: form-data; name=\"photo\"; filename=\"${file.name}\"$lineEnd"
+                    )
+                    output.writeBytes("Content-Type: image/png$lineEnd$lineEnd")
+
+                    file.inputStream().use { input ->
+                        val buffer = ByteArray(4096)
+                        var bytesRead = input.read(buffer)
+                        while (bytesRead != -1) {
+                            output.write(buffer, 0, bytesRead)
+                            bytesRead = input.read(buffer)
+                        }
+                    }
+
+                    output.writeBytes(lineEnd)
+                    output.writeBytes(twoHyphens + boundary + twoHyphens + lineEnd)
+                    output.flush()
+                }
+
+                val code = connection.responseCode
+                if (code != HttpURLConnection.HTTP_OK) {
+                    throw RuntimeException("HTTP $code")
+                }
+            }
+
+            withContext(Dispatchers.Main) {
+                Toast.makeText(
+                    this@MainActivity,
+                    "Скриншот отправлен в Telegram",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+            withContext(Dispatchers.Main) {
+                Toast.makeText(
+                    this@MainActivity,
+                    "Ошибка отправки скриншота: ${e.message}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -33,14 +167,12 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     ScoreboardScreen(
 
-                        // Финальное сохранение игры:
-                        // локальная БД/файл делаются внутри ScoreboardScreen,
-                        // здесь только отправка на Raspi в архив.
+                        // Когда игра завершена — отправляем finished JSON на Raspi
                         onGameSaved = { file ->
                             lifecycleScope.launch(Dispatchers.IO) {
                                 val json = runCatching {
                                     file.readText(Charsets.UTF_8)
-                                }.getOrElse { e ->
+                                }.getOrElse {
                                     withContext(Dispatchers.Main) {
                                         Toast.makeText(
                                             this@MainActivity,
@@ -52,7 +184,7 @@ class MainActivity : ComponentActivity() {
                                 }
 
                                 val res = raspiRepo.uploadFinishedGame(json)
-                                if (!res.success && res.errorMessage != null) {
+                                if (!res.success) {
                                     withContext(Dispatchers.Main) {
                                         Toast.makeText(
                                             this@MainActivity,
@@ -64,12 +196,12 @@ class MainActivity : ComponentActivity() {
                             }
                         },
 
-                        // Онлайн-обновление текущей игры: отправляем только на Raspi
+                        // Обновление active_game.json на сервере
                         onGameJsonUpdated = { file ->
                             lifecycleScope.launch(Dispatchers.IO) {
                                 val json = runCatching {
                                     file.readText(Charsets.UTF_8)
-                                }.getOrElse { e ->
+                                }.getOrElse {
                                     withContext(Dispatchers.Main) {
                                         Toast.makeText(
                                             this@MainActivity,
@@ -81,7 +213,7 @@ class MainActivity : ComponentActivity() {
                                 }
 
                                 val res = raspiRepo.uploadActiveGame(json)
-                                if (!res.success && res.errorMessage != null) {
+                                if (!res.success) {
                                     withContext(Dispatchers.Main) {
                                         Toast.makeText(
                                             this@MainActivity,
@@ -93,30 +225,19 @@ class MainActivity : ComponentActivity() {
                             }
                         },
 
-                        // Начало новой игры – при необходимости сюда позже можно
-                        // добавить отдельный запрос на Raspi (например, очистку active_game.json)
                         onNewGameStarted = {
-                            // Пока ничего дополнительно не делаем
+                            // пока ничего
                         },
 
-                        // Удаление игры:
-                        // 1) пытаемся удалить на Raspi;
-                        // 2) только при успехе чистим локальную БД и файл.
-                        onGameDeleted = { gameId: String, file: File? ->
+                        onGameDeleted = { gameId: String, file: File?, onResult: (Boolean) -> Unit ->
                             lifecycleScope.launch(Dispatchers.IO) {
                                 val dao = gameDb.gameDao()
-
-                                // Пытаемся получить запись, чтобы узнать сезон
-                                val entry = runCatching {
-                                    dao.getGameById(gameId)
-                                }.getOrNull()
-
+                                val entry = dao.getGameById(gameId)
                                 val season = entry?.season
 
                                 if (season == null) {
-                                    // Сезон не нашли – удаляем только локально
                                     dao.deleteGameById(gameId)
-                                    file?.let { if (it.exists()) it.delete() }
+                                    file?.delete()
 
                                     withContext(Dispatchers.Main) {
                                         Toast.makeText(
@@ -125,14 +246,13 @@ class MainActivity : ComponentActivity() {
                                             Toast.LENGTH_LONG
                                         ).show()
                                     }
+                                    onResult(true)
                                     return@launch
                                 }
 
-                                // Запрос на удаление игры на Raspi
                                 val res = raspiRepo.deleteFinishedGame(season, gameId)
 
                                 if (!res.success) {
-                                    // Сервер не подтвердил удаление – локальную копию НЕ трогаем
                                     withContext(Dispatchers.Main) {
                                         Toast.makeText(
                                             this@MainActivity,
@@ -140,12 +260,12 @@ class MainActivity : ComponentActivity() {
                                             Toast.LENGTH_LONG
                                         ).show()
                                     }
+                                    onResult(false)
                                     return@launch
                                 }
 
-                                // Успешно удалено на Raspi – чистим локально
                                 dao.deleteGameById(gameId)
-                                file?.let { if (it.exists()) it.delete() }
+                                file?.delete()
 
                                 withContext(Dispatchers.Main) {
                                     Toast.makeText(
@@ -154,7 +274,12 @@ class MainActivity : ComponentActivity() {
                                         Toast.LENGTH_SHORT
                                     ).show()
                                 }
+                                onResult(true)
                             }
+                        },
+
+                        onFinalScreenshotRequested = {
+                            takeAndSendScoreboardScreenshot()
                         }
                     )
                 }

@@ -53,6 +53,189 @@ import kotlinx.coroutines.launch
 import com.example.hockeyscoreboard.data.SettingsRepositoryImpl
 import com.example.hockeyscoreboard.data.SyncRepository
 import com.example.hockeyscoreboard.data.SyncResult
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import java.io.DataOutputStream
+import java.net.HttpURLConnection
+import java.net.URL
+import androidx.compose.runtime.mutableStateMapOf
+
+
+
+
+
+// Описание одной записи из roster.json
+data class ImportedRosterItem(
+    val fullName: String,
+    val team: String,   // "red" / "white"
+    val role: String?,
+    val line: Int?,
+    val userId: String?,   // внешний UserID в виде строки
+    val eventId: String?   // внешний EventID (игровое событие)
+)
+
+// Нормализация имени для поиска по базовому списку
+private fun normalizeName(name: String): String =
+    name.trim()
+        .replace("\\s+".toRegex(), " ")
+        .lowercase(Locale.getDefault())
+
+
+
+// --- Снапшот активной незавершённой игры из active_game.json ---
+data class ActiveGameSnapshot(
+    val season: String,
+    val playersRed: List<String>,
+    val playersWhite: List<String>,
+    val goals: List<GoalEvent>,
+    val rosterChanges: List<RosterChangeEvent>,
+    val gameStartMillis: Long,      // всегда НЕ null
+    val finished: Boolean,
+    val externalEventId: String?
+)
+
+
+// Загрузка снапшота активной незавершённой игры из active_game.json
+fun loadActiveGameSnapshotOrNull(context: Context): ActiveGameSnapshot? {
+    val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+    val dbRoot = File(baseDir, "hockey-json")
+    val activeFile = File(dbRoot, "active_game.json")
+
+    if (!activeFile.exists() || !activeFile.isFile) return null
+
+    return try {
+        val text = activeFile.readText(Charsets.UTF_8)
+        val root = org.json.JSONObject(text)
+
+        val finished = root.optBoolean("finished", false)
+        // Восстанавливаем только незавершённую игру
+        if (finished) return null
+
+        val season = root.optString("season", getCurrentSeason(context))
+
+        // date → gameStartMillis (если не удалось – берём время файла)
+        val dateStr = root.optString("date", "")
+        val gameStartMillis: Long = if (dateStr.isNotBlank()) {
+            try {
+                val fmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
+                fmt.parse(dateStr)?.time ?: activeFile.lastModified()
+            } catch (_: Exception) {
+                activeFile.lastModified()
+            }
+        } else {
+            activeFile.lastModified()
+        }
+
+        val externalEventId = if (root.has("externalEventId")) {
+            root.optString("externalEventId").takeIf { it.isNotBlank() }
+        } else null
+
+        // --- Составы команд ---
+        val teamsObj = root.optJSONObject("teams") ?: return null
+
+        fun readTeamPlayers(key: String): List<String> {
+            val teamObj = teamsObj.optJSONObject(key) ?: return emptyList()
+            val arr = teamObj.optJSONArray("players") ?: return emptyList()
+            val result = mutableListOf<String>()
+            for (i in 0 until arr.length()) {
+                val name = arr.optString(i).trim()
+                if (name.isNotEmpty()) result += name
+            }
+            return result
+        }
+
+        val playersRed = readTeamPlayers("RED")
+        val playersWhite = readTeamPlayers("WHITE")
+
+// --- Голы ---
+        val goalsArray = root.optJSONArray("goals") ?: org.json.JSONArray()
+        val goals = mutableListOf<GoalEvent>()
+
+        for (i in 0 until goalsArray.length()) {
+            val obj = goalsArray.optJSONObject(i) ?: continue
+
+            val teamStr = obj.optString("team", "")
+                .trim()
+                .uppercase(Locale.getDefault())
+
+            val team = try {
+                Team.valueOf(teamStr)
+            } catch (_: Exception) {
+                continue
+            }
+
+            val scorer = obj.optString("scorer", "").trim()
+            if (scorer.isEmpty()) continue
+
+            val assist1 = obj.optString("assist1", "").trim().ifEmpty { null }
+            val assist2 = obj.optString("assist2", "").trim().ifEmpty { null }
+
+            val order = obj.optLong("order", (i + 1).toLong())
+            val id = (i + 1).toLong()
+
+            goals += GoalEvent(
+                id = id,
+                team = team,
+                scorer = scorer,
+                assist1 = assist1,
+                assist2 = assist2,
+                eventOrder = order,
+                timestampMillis = 1L
+            )
+        }
+
+
+        // --- Переходы в составах ---
+        val rosterArray = root.optJSONArray("rosterChanges") ?: org.json.JSONArray()
+        val rosterChanges = mutableListOf<RosterChangeEvent>()
+
+        for (i in 0 until rosterArray.length()) {
+            val obj = rosterArray.optJSONObject(i) ?: continue
+
+            val id = obj.optLong("id", (i + 1).toLong())
+            val player = obj.optString("player", "").trim()
+            if (player.isEmpty()) continue
+
+            val fromTeamStr = obj.optString("fromTeam", "").trim()
+            val toTeamStr = obj.optString("toTeam", "").trim()
+
+            val fromTeam = fromTeamStr.takeIf { it.isNotEmpty() }?.let { value ->
+                try { Team.valueOf(value) } catch (_: Exception) { null }
+            }
+
+            val toTeam = toTeamStr.takeIf { it.isNotEmpty() }?.let { value ->
+                try { Team.valueOf(value) } catch (_: Exception) { null }
+            }
+
+            val order = obj.optLong("order", (i + goals.size + 1).toLong())
+
+            rosterChanges += RosterChangeEvent(
+                id = id,
+                player = player,
+                fromTeam = fromTeam,
+                toTeam = toTeam,
+                eventOrder = order
+            )
+        }
+
+        ActiveGameSnapshot(
+            season = season,
+            playersRed = playersRed,
+            playersWhite = playersWhite,
+            goals = goals,
+            rosterChanges = rosterChanges,
+            gameStartMillis = gameStartMillis,
+            finished = finished,
+            externalEventId = externalEventId
+        )
+    } catch (e: Exception) {
+        e.printStackTrace()
+        null
+    }
+}
+
+
+
 
 
 // --- Цвета для всплывающих окон в общем стиле ---
@@ -78,22 +261,38 @@ fun ScoreboardScreen(
     onGameSaved: (File) -> Unit = {},
     onGameJsonUpdated: (File) -> Unit = {},
     onNewGameStarted: () -> Unit = {},
-    onGameDeleted: (gameId: String, file: File?) -> Unit = { _, _ -> }
+    onGameDeleted: (gameId: String, file: File?, onResult: (Boolean) -> Unit) -> Unit = { _, _, onResult ->
+        onResult(false)
+    },
+
+    onFinalScreenshotRequested: () -> Unit = {}
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
     val settingsRepository = remember { SettingsRepositoryImpl(context) }
     val syncRepository = remember { SyncRepository(context, settingsRepository) }
+    val raspiRepository = remember { RaspiRepository(settingsRepository) }
+
 
     var isSyncing by remember { mutableStateOf(false) }
     var serverUrl by remember { mutableStateOf("") }
     var apiKey by remember { mutableStateOf("") }
+    var telegramBotToken by remember { mutableStateOf("") }
+    var telegramChatId by remember { mutableStateOf("") }
+
+
+
+
+
 
     LaunchedEffect(Unit) {
         serverUrl = settingsRepository.getServerUrl()
         apiKey = settingsRepository.getApiKey()
+        telegramBotToken = (settingsRepository as SettingsRepositoryImpl).getTelegramBotToken()
+        telegramChatId = (settingsRepository as SettingsRepositoryImpl).getTelegramChatId()
     }
+
 
 
     val prefs = remember {
@@ -115,16 +314,30 @@ fun ScoreboardScreen(
     }
     var newPlayerName by remember { mutableStateOf("") }
 
+
+
+
+
+
+
+
     // СОСТАВЫ КОМАНД
     var playersRedText by rememberSaveable { mutableStateOf("") }
     var playersWhiteText by rememberSaveable { mutableStateOf("") }
 
+    fun parsePlayers(text: String): List<String> =
+        text.lines()
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+
+
     val playersRed: List<String> = remember(playersRedText) {
-        playersRedText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        parsePlayers(playersRedText)
     }
     val playersWhite: List<String> = remember(playersWhiteText) {
-        playersWhiteText.lines().map { it.trim() }.filter { it.isNotEmpty() }
+        parsePlayers(playersWhiteText)
     }
+
 
     // доступные для распределения игроки
     val availablePlayers: List<String> = remember(basePlayers, playersRed, playersWhite) {
@@ -132,6 +345,21 @@ fun ScoreboardScreen(
             .filter { it !in playersRed && it !in playersWhite }
             .sorted()
     }
+
+    // Внешний EventID, пришедший из roster.json (оставляем для выгрузки вовне)
+    var externalEventId by rememberSaveable {
+        mutableStateOf(getActiveEventId(prefs))
+    }
+
+
+    // Временное хранилище результатов импорта состава (только имена)
+    var importedRedFromRoster by remember { mutableStateOf<List<String>>(emptyList()) }
+    var importedWhiteFromRoster by remember { mutableStateOf<List<String>>(emptyList()) }
+
+    // Неизвестные игроки из roster.json (их нет в базовом списке)
+    var unknownRosterItems by remember { mutableStateOf<List<ImportedRosterItem>>(emptyList()) }
+    var showUnknownPlayersDialog by remember { mutableStateOf(false) }
+
 
     // ФЛАГИ ДИАЛОГОВ / МЕНЮ
     var showBasePlayersDialog by remember { mutableStateOf(false) }
@@ -143,7 +371,9 @@ fun ScoreboardScreen(
     var showActionsMenu by remember { mutableStateOf(false) }
     var showNoTeamsDialog by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
-
+    // Ключ, который будем увеличивать после удаления игры,
+    // чтобы диалог "Завершённые игры" перечитал список из Room
+    var historyRefreshKey by remember { mutableStateOf(0L) }
     // Текущая выбранная игра (для истории)
     var historySelectedEntry by remember { mutableStateOf<GameEntry?>(null) }
     var historySelectedFile by remember { mutableStateOf<File?>(null) }
@@ -184,7 +414,13 @@ fun ScoreboardScreen(
 
     var goalOptionsFor by remember { mutableStateOf<GoalEvent?>(null) }
 
+
     var gameFinished by rememberSaveable { mutableStateOf(false) }
+
+
+
+    // --- УТИЛИТЫ ---
+
 
     // --- УТИЛИТЫ ---
 
@@ -218,6 +454,57 @@ fun ScoreboardScreen(
         resetGoalInput()
         goalOptionsFor = null
     }
+
+    // Обновление внешнего EventID + запись в SharedPreferences,
+    // чтобы он переживал перезапуск приложения
+    fun updateExternalEventId(newId: String?) {
+        externalEventId = newId
+        setActiveEventId(prefs, newId)
+    }
+
+    // Применение снапшота активной игры, загруженного из active_game.json
+    fun applyActiveSnapshot(snapshot: ActiveGameSnapshot) {
+        // Сезон из снапшота
+        currentSeason = snapshot.season
+
+        // Составы в текстовые поля (они дальше сами распарсятся в playersRed/playersWhite)
+        playersRedText = snapshot.playersRed.joinToString("\n")
+        playersWhiteText = snapshot.playersWhite.joinToString("\n")
+
+        // Голы и переходы в протокол
+        goals = snapshot.goals
+        rosterChanges = snapshot.rosterChanges
+
+        // Время старта и флаг завершённости (на практике finished тут всегда false)
+        gameStartMillis = snapshot.gameStartMillis
+        gameFinished = snapshot.finished
+
+        // Восстанавливаем внешний EventID (и в prefs тоже)
+        updateExternalEventId(snapshot.externalEventId)
+
+        // Пересчитываем следующие идентификаторы и порядок событий
+        nextGoalId = (goals.maxOfOrNull { it.id } ?: 0L) + 1L
+        nextRosterChangeId = (rosterChanges.maxOfOrNull { it.id } ?: 0L) + 1L
+
+        val maxOrderFromGoals = goals.maxOfOrNull { it.eventOrder } ?: 0L
+        val maxOrderFromRoster = rosterChanges.maxOfOrNull { it.eventOrder } ?: 0L
+        nextEventOrder = maxOf(maxOrderFromGoals, maxOrderFromRoster) + 1L
+
+        // Зафиксируем снапшоты составов, чтобы дальнейшие изменения через диалог
+        // "Составы команд" корректно порождали события rosterChanges
+        lastLineupsRedSnapshot = snapshot.playersRed
+        lastLineupsWhiteSnapshot = snapshot.playersWhite
+        hasBaselineLineups = true
+    }
+
+    // При первом запуске экрана пробуем восстановить незавершённую игру из active_game.json
+    LaunchedEffect(Unit) {
+        val snapshot = loadActiveGameSnapshotOrNull(context)
+        if (snapshot != null) {
+            applyActiveSnapshot(snapshot)
+        }
+    }
+
 
 
 
@@ -383,11 +670,10 @@ fun ScoreboardScreen(
         val fileFormat = SimpleDateFormat("yyyy-MM-dd_HH-mm-ss", Locale.getDefault())
         val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
 
-        // Старт игры фиксируем один раз
         val startMillis = gameStartMillis ?: System.currentTimeMillis().also { gameStartMillis = it }
         val startDate = Date(startMillis)
 
-        val baseId = fileFormat.format(startDate) + "_pestovo"   // без .json
+        val baseId = fileFormat.format(startDate) + "_pestovo"
         val fileName = "$baseId.json"
         val dateIso = isoFormat.format(startDate)
 
@@ -395,14 +681,19 @@ fun ScoreboardScreen(
 
         val root = org.json.JSONObject()
 
-        // Два идентификатора, чтобы всем было хорошо:
-        root.put("id", baseId)          // то, что ждёт Raspi для finished/<season>/<id>.json
-        root.put("gameId", baseId)      // как и раньше внутри приложения
-
+        root.put("id", baseId)
+        root.put("gameId", baseId)
         root.put("arena", "Пестово Арена")
         root.put("date", dateIso)
         root.put("season", season)
         root.put("finished", isFinal)
+        // Если есть внешний EventID от сервера — пишем его в JSON активной/завершённой игры
+        externalEventId
+            ?.takeIf { it.isNotBlank() }
+            ?.let { root.put("externalEventId", it) }
+
+        val playersRedCurrent = parsePlayers(playersRedText)
+        val playersWhiteCurrent = parsePlayers(playersWhiteText)
 
         val teamsObj = org.json.JSONObject()
         val redObj = org.json.JSONObject()
@@ -412,16 +703,15 @@ fun ScoreboardScreen(
         whiteObj.put("name", "Белые")
 
         val redPlayersArray = org.json.JSONArray()
-        playersRed.forEach { redPlayersArray.put(it) }
+        playersRedCurrent.forEach { redPlayersArray.put(it) }
         redObj.put("players", redPlayersArray)
 
         val whitePlayersArray = org.json.JSONArray()
-        playersWhite.forEach { whitePlayersArray.put(it) }
+        playersWhiteCurrent.forEach { whitePlayersArray.put(it) }
         whiteObj.put("players", whitePlayersArray)
 
         teamsObj.put("RED", redObj)
         teamsObj.put("WHITE", whiteObj)
-
         root.put("teams", teamsObj)
 
         val currentRedScore = goals.count { it.team == Team.RED }
@@ -465,6 +755,250 @@ fun ScoreboardScreen(
         return fileName to root.toString(2)
     }
 
+
+    fun saveExternalEventJson(gameId: String) {
+        // База hockey-json
+        val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+        val dbRoot = File(baseDir, "hockey-json")
+        if (!dbRoot.exists()) dbRoot.mkdirs()
+
+        // Подпапка для экспортируемых событий
+        val exportDir = File(dbRoot, "external-events")
+        if (!exportDir.exists()) exportDir.mkdirs()
+
+        // --- агрегируем статистику игроков ---
+
+        data class PlayerStats(
+            var team: String,
+            var goalsCount: Int,
+            var assistsCount: Int
+        )
+
+        val statsByName = mutableMapOf<String, PlayerStats>()
+
+        fun ensurePlayer(name: String, teamFallback: String): PlayerStats {
+            val existing = statsByName[name]
+            if (existing != null) return existing
+
+            val resolvedTeam = when {
+                playersRed.contains(name) -> "red"
+                playersWhite.contains(name) -> "white"
+                else -> teamFallback
+            }
+
+            return PlayerStats(
+                team = resolvedTeam,
+                goalsCount = 0,
+                assistsCount = 0
+            ).also { statsByName[name] = it }
+        }
+
+        // --- считаем голы/передачи ---
+        goals.sortedBy { it.eventOrder }.forEach { goal ->
+            val teamStr = if (goal.team == Team.RED) "red" else "white"
+
+            ensurePlayer(goal.scorer, teamStr).apply { goalsCount += 1 }
+
+            goal.assist1?.let { name ->
+                ensurePlayer(name, teamStr).apply { assistsCount += 1 }
+            }
+            goal.assist2?.let { name ->
+                ensurePlayer(name, teamStr).apply { assistsCount += 1 }
+            }
+        }
+
+        // --- players[] ---
+        val playersArray = org.json.JSONArray()
+
+        statsByName.entries
+            .sortedBy { it.key }
+            .forEach { (name, ps) ->
+                val obj = org.json.JSONObject()
+                obj.put("user_id", name)           // ФИО → идентификатор
+                obj.put("team", ps.team)
+                obj.put("goals", ps.goalsCount)
+                obj.put("assists", ps.assistsCount)
+                playersArray.put(obj)
+            }
+
+        // --- goals[] ---
+        val goalsArray = org.json.JSONArray()
+        val start = gameStartMillis ?: System.currentTimeMillis()
+
+        goals.sortedBy { it.eventOrder }.forEach { goal ->
+            val obj = org.json.JSONObject()
+
+            obj.put("team", if (goal.team == Team.RED) "red" else "white")
+
+            obj.put("scorer_id", goal.scorer)
+            obj.put("assist1_id", goal.assist1 ?: org.json.JSONObject.NULL)
+            obj.put("assist2_id", goal.assist2 ?: org.json.JSONObject.NULL)
+
+            // minute = разница между временем гола и временем старта
+            val minute = if (goal.timestampMillis != null) {
+                ((goal.timestampMillis!! - start) / 60000L).coerceAtLeast(0)
+            } else {
+                0L
+            }
+            obj.put("minute", minute)
+
+            goalsArray.put(obj)
+        }
+
+        // --- итоговый JSON ---
+        // --- итоговый JSON ---
+        val root = org.json.JSONObject().apply {
+            // Если есть внешний EventID — используем его, иначе падаем обратно на локальный gameId
+            val eventIdForExport = externalEventId?.takeIf { it.isNotBlank() } ?: gameId
+
+            put("event_id", eventIdForExport)
+            put("score_white", whiteScore)
+            put("score_red", redScore)
+            put("players", playersArray)
+            put("goals", goalsArray)
+        }
+
+
+        val outFile = File(exportDir, "$gameId.json")
+        outFile.writeText(root.toString(2), Charsets.UTF_8)
+    }
+
+    fun saveExternalEventJsonForServer(gameId: String) {
+        // База hockey-json
+        val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+        val dbRoot = File(baseDir, "hockey-json")
+        if (!dbRoot.exists()) dbRoot.mkdirs()
+
+        // Папка под формат внешнего API
+        val exportDir = File(dbRoot, "external-events-api")
+        if (!exportDir.exists()) exportDir.mkdirs()
+
+        // Карта "ФИО -> внешний UserID"
+        val nameToExternalId: Map<String, String> =
+            basePlayers
+                .filter { !it.userId.isNullOrBlank() }
+                .associate { it.name to it.userId!!.trim() }
+
+        // Внутренняя структура
+        data class PlayerStatsExt(
+            val userId: String,
+            val name: String,
+            var team: String,
+            var goalsCount: Int,
+            var assistsCount: Int
+        )
+
+        val statsByName = mutableMapOf<String, PlayerStatsExt>()
+
+        fun ensurePlayer(name: String, teamFallback: String): PlayerStatsExt {
+            val existing = statsByName[name]
+            if (existing != null) return existing
+
+            val externalId = nameToExternalId[name] ?: name
+            val resolvedTeam = when {
+                playersRed.contains(name) -> "red"
+                playersWhite.contains(name) -> "white"
+                else -> teamFallback
+            }
+
+            return PlayerStatsExt(
+                userId = externalId,
+                name = name,
+                team = resolvedTeam,
+                goalsCount = 0,
+                assistsCount = 0
+            ).also { statsByName[name] = it }
+        }
+
+        // --- Заполняем игроков из составов ---
+        playersRed.forEach { ensurePlayer(it, "red") }
+        playersWhite.forEach { ensurePlayer(it, "white") }
+
+        // --- Считаем голы ---
+        goals.sortedBy { it.eventOrder }.forEach { g ->
+            val t = if (g.team == Team.RED) "red" else "white"
+            ensurePlayer(g.scorer, t).goalsCount += 1
+            g.assist1?.let { ensurePlayer(it, t).assistsCount += 1 }
+            g.assist2?.let { ensurePlayer(it, t).assistsCount += 1 }
+        }
+
+        // --- players[] ---
+        val playersArray = org.json.JSONArray()
+        statsByName.values.sortedBy { it.name }.forEach { ps ->
+            val o = org.json.JSONObject()
+            o.put("user_id", ps.userId)
+            o.put("name", ps.name)
+            o.put("team", ps.team)
+            o.put("goals", ps.goalsCount)
+            o.put("assists", ps.assistsCount)
+            playersArray.put(o)
+        }
+
+        // --- Голы ---
+        val start = gameStartMillis ?: System.currentTimeMillis()
+
+        fun toUserIdOrZero(s: String?): Long = s?.toLongOrNull() ?: 0L
+
+        val goalsArray = org.json.JSONArray()
+
+        goals.sortedBy { it.eventOrder }.forEachIndexed { idx, g ->
+            val teamStr = if (g.team == Team.RED) "red" else "white"
+
+            val scorerRaw = nameToExternalId[g.scorer]
+            val assist1Raw = g.assist1?.let { nameToExternalId[it] }
+            val assist2Raw = g.assist2?.let { nameToExternalId[it] }
+
+            val scorerId = toUserIdOrZero(scorerRaw)
+            val assist1Id = assist1Raw?.toLongOrNull() ?: if (g.assist1 == null) null else 0L
+            val assist2Id = assist2Raw?.toLongOrNull() ?: if (g.assist2 == null) null else 0L
+
+            val minuteJson: Any =
+                if (g.timestampMillis != null && g.timestampMillis != 1L) {
+                    ((g.timestampMillis - start) / 60000L).coerceAtLeast(0)
+                } else {
+                    org.json.JSONObject.NULL
+                }
+
+            val o = org.json.JSONObject()
+            o.put("idx", idx + 1)
+            o.put("team", teamStr)
+            o.put("minute", minuteJson)
+
+            // IDs для бота
+            o.put("scorer_user_id", scorerId)
+            if (assist1Id == null) o.put("assist1_user_id", org.json.JSONObject.NULL)
+            else o.put("assist1_user_id", assist1Id)
+
+            if (assist2Id == null) o.put("assist2_user_id", org.json.JSONObject.NULL)
+            else o.put("assist2_user_id", assist2Id)
+
+            // Читаемые фамилии
+            o.put("scorer_name", g.scorer)
+            o.put("assist1_name", g.assist1 ?: org.json.JSONObject.NULL)
+            o.put("assist2_name", g.assist2 ?: org.json.JSONObject.NULL)
+
+            goalsArray.put(o)
+        }
+
+        // --- event_id должен быть INT (или 0 при ошибке) ---
+        val eventIdStr = externalEventId?.takeIf { it.isNotBlank() } ?: gameId
+        val eventIdInt = eventIdStr.toIntOrNull() ?: 0
+
+        // --- Итоговый JSON ---
+        val root = org.json.JSONObject().apply {
+            put("event_id", eventIdInt)        // теперь INT
+            put("score_white", whiteScore)
+            put("score_red", redScore)
+            put("players", playersArray)
+            put("goals", goalsArray)
+        }
+
+        // Имя файла
+        val outFile = File(exportDir, "result_${eventIdInt}.json")
+        outFile.writeText(root.toString(2), Charsets.UTF_8)
+    }
+
+
     fun saveGameJsonToFile(isFinal: Boolean = false): File {
         val (fileName, json) = buildGameJson(isFinal)
 
@@ -477,49 +1011,195 @@ fun ScoreboardScreen(
         return file
     }
 
-    /**
-     * Любое обновление игры.
-     * 1) сохраняем JSON,
-     * 2) обновляем запись в Room,
-     * 3) уведомляем наружу (MainActivity решает, что делать дальше).
-     */
-    fun notifyGameJsonUpdated(isFinal: Boolean = false) {
-        val file = saveGameJsonToFile(isFinal)
+    // Сохранение active_game.json (может быть как незавершённой, так и завершённой)
+    fun saveActiveGameJsonToFile(isFinal: Boolean): File {
+        val (_, json) = buildGameJson(isFinal)
 
-        val now = System.currentTimeMillis()
-        val finishedAt = if (isFinal) now else null
-        val startedAt = gameStartMillis ?: now
-        val gameId = file.name.removeSuffix(".json")
-        val seasonLocal = currentSeason
+        val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+        val dbRoot = File(baseDir, "hockey-json")
+        if (!dbRoot.exists()) dbRoot.mkdirs()
 
-        val entry = GameEntry(
-            gameId = gameId,
-            fileName = file.name,
-            season = seasonLocal,
-            localPath = file.absolutePath,
-            startedAt = startedAt,
-            finishedAt = finishedAt,
-            redScore = redScore,
-            whiteScore = whiteScore
-        )
-        gameDao.upsertGame(entry)
+        val file = File(dbRoot, "active_game.json")
+        file.writeText(json, Charsets.UTF_8)
+        return file
+    }
 
-        if (isFinal) {
-            onGameSaved(file)
-        } else {
-            onGameJsonUpdated(file)
+    fun sendExternalEventToTelegramIfConfigured(gameId: String) {
+        val token = telegramBotToken.trim()
+        val chat = telegramChatId.trim()
+
+        // Если настройки не заданы – тихо выходим
+        if (token.isEmpty() || chat.isEmpty()) return
+
+        val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+        val dbRoot = File(baseDir, "hockey-json")
+
+        // Отдельная папка под формат для внешнего API
+        val exportDirApi = File(dbRoot, "external-events-api")
+
+        // event_id = внешний, если есть, иначе наш gameId
+        val eventIdValue: String =
+            externalEventId?.takeIf { it.isNotBlank() } ?: gameId
+
+        // Ищем файл по новой схеме имени: result_<event_id>.json
+        val apiFile = File(exportDirApi, "result_${eventIdValue}.json")
+
+        if (!apiFile.exists()) {
+            Toast.makeText(
+                context,
+                "Файл статистики для Telegram не найден",
+                Toast.LENGTH_LONG
+            ).show()
+            return
+        }
+
+        scope.launch {
+            try {
+                withContext(Dispatchers.IO) {
+                    fun sendFileToTelegram(file: File) {
+                        val url = URL("https://api.telegram.org/bot$token/sendDocument")
+                        val boundary = "HSB-${System.currentTimeMillis()}-${file.name}"
+                        val lineEnd = "\r\n"
+                        val twoHyphens = "--"
+
+                        val connection = (url.openConnection() as HttpURLConnection).apply {
+                            requestMethod = "POST"
+                            doInput = true
+                            doOutput = true
+                            useCaches = false
+                            setRequestProperty(
+                                "Content-Type",
+                                "multipart/form-data; boundary=$boundary"
+                            )
+                        }
+
+                        DataOutputStream(connection.outputStream).use { output ->
+                            // chat_id
+                            output.writeBytes(twoHyphens + boundary + lineEnd)
+                            output.writeBytes(
+                                "Content-Disposition: form-data; name=\"chat_id\"$lineEnd$lineEnd"
+                            )
+                            output.writeBytes(chat + lineEnd)
+
+                            // document
+                            output.writeBytes(twoHyphens + boundary + lineEnd)
+                            output.writeBytes(
+                                "Content-Disposition: form-data; name=\"document\"; filename=\"${file.name}\"$lineEnd"
+                            )
+                            output.writeBytes("Content-Type: application/json$lineEnd$lineEnd")
+
+                            file.inputStream().use { input ->
+                                val buffer = ByteArray(4096)
+                                var bytesRead: Int
+                                while (input.read(buffer).also { bytesRead = it } != -1) {
+                                    output.write(buffer, 0, bytesRead)
+                                }
+                            }
+                            output.writeBytes(lineEnd)
+
+                            // закрываем multipart
+                            output.writeBytes(twoHyphens + boundary + twoHyphens + lineEnd)
+                            output.flush()
+                        }
+
+                        val code = connection.responseCode
+                        if (code != HttpURLConnection.HTTP_OK) {
+                            throw RuntimeException("HTTP $code (${file.name})")
+                        }
+                    }
+
+                    // Отправляем только новый файл для внешнего API
+                    sendFileToTelegram(apiFile)
+                }
+
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(
+                        context,
+                        "Статистика отправлена в Telegram",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(
+                        context,
+                        "Ошибка отправки в Telegram: ${e.message}",
+                        Toast.LENGTH_LONG
+                    ).show()
+                }
+            }
         }
     }
 
+
+    fun notifyGameJsonUpdated(isFinal: Boolean = false) {
+        if (isFinal) {
+            // 1. Пишем окончательный JSON в finished/<season>
+            val finishedFile = saveGameJsonToFile(isFinal = true)
+
+            val now = System.currentTimeMillis()
+            val startedAt = gameStartMillis ?: now
+            val finishedAt = now
+            val gameId = finishedFile.name.removeSuffix(".json")
+            val seasonLocal = currentSeason
+
+            // 2. Обновляем индекс в Room (только для завершённых игр)
+            val entry = GameEntry(
+                gameId = gameId,
+                fileName = finishedFile.name,
+                season = seasonLocal,
+                localPath = finishedFile.absolutePath,
+                startedAt = startedAt,
+                finishedAt = finishedAt,
+                redScore = redScore,
+                whiteScore = whiteScore
+            )
+            gameDao.upsertGame(entry)
+
+            // 3. JSON для внешней системы (наш внутренний формат)
+            saveExternalEventJson(gameId)
+
+            // 3b. JSON для внешнего API (формат event_id + user_id)
+            saveExternalEventJsonForServer(gameId)
+
+            // 3c. Автоматическая отправка файла external-events в Telegram (если настроено)
+            sendExternalEventToTelegramIfConfigured(gameId)
+
+
+            // 4. Уведомляем о сохранённой игре (MainActivity шлёт finished-файл на RasPi)
+            onGameSaved(finishedFile)
+
+            // 5. И ДОПОЛНИТЕЛЬНО отправляем обновлённый active_game.json
+            //    уже со статусом finished = true, чтобы онлайн-табло переключилось
+            val activeFile = saveActiveGameJsonToFile(isFinal = true)
+            onGameJsonUpdated(activeFile)
+
+        } else {
+            // Обычное обновление: только активная игра
+            val activeFile = saveActiveGameJsonToFile(isFinal = false)
+            onGameJsonUpdated(activeFile)
+        }
+    }
+
+
+
     fun commitGoalIfPossible() {
         if (gameFinished) return
+
         val team = goalInputTeam ?: return
         val scorer = tempScorer ?: return
-
         val id = editingGoalId ?: nextGoalId++
 
         val existingOrder = goals.find { it.id == id }?.eventOrder
         val order = existingOrder ?: nextEventOrder++
+
+        // старт игры фиксируем, если ещё не зафиксирован
+        val startMillis = gameStartMillis ?: System.currentTimeMillis().also {
+            gameStartMillis = it
+        }
+
+        val timestamp = System.currentTimeMillis()
 
         val newEvent = GoalEvent(
             id = id,
@@ -527,7 +1207,8 @@ fun ScoreboardScreen(
             scorer = scorer,
             assist1 = tempAssist1,
             assist2 = tempAssist2,
-            eventOrder = order
+            eventOrder = order,
+            timestampMillis = timestamp
         )
 
         goals = if (editingGoalId == null) {
@@ -539,6 +1220,8 @@ fun ScoreboardScreen(
         notifyGameJsonUpdated(isFinal = false)
         resetGoalInput()
     }
+
+
 
     fun handlePlayerClick(player: String) {
         if (gameFinished) return
@@ -601,6 +1284,11 @@ fun ScoreboardScreen(
             ).show()
         }
     }
+
+
+
+
+
 
     // --- ОСНОВНОЙ ЭКРАН ---
 
@@ -991,11 +1679,49 @@ fun ScoreboardScreen(
                         )
                     )
 
+                    OutlinedTextField(
+                        value = telegramBotToken,
+                        onValueChange = { telegramBotToken = it },
+                        label = { Text("Telegram Bot Token") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = DialogTitleColor,
+                            unfocusedTextColor = DialogTitleColor,
+                            cursorColor = DialogTitleColor,
+                            focusedBorderColor = Color(0xFF546E7A),
+                            unfocusedBorderColor = Color(0xFF455A64)
+                        )
+                    )
+
+                    OutlinedTextField(
+                        value = telegramChatId,
+                        onValueChange = { telegramChatId = it },
+                        label = { Text("Telegram Chat ID / Channel") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = DialogTitleColor,
+                            unfocusedTextColor = DialogTitleColor,
+                            cursorColor = DialogTitleColor,
+                            focusedBorderColor = Color(0xFF546E7A),
+                            unfocusedBorderColor = Color(0xFF455A64)
+                        )
+                    )
+
+
                     TextButton(
                         onClick = {
-                            if (!isSyncing) {
+                            // Если уже идёт синхронизация — игнорируем повторный клик
+                            if (isSyncing) return@TextButton
+
+                            scope.launch {
                                 isSyncing = true
-                                scope.launch {
+                                try {
                                     val result = syncRepository.syncDatabase()
 
                                     if (result is SyncResult.Success) {
@@ -1005,13 +1731,14 @@ fun ScoreboardScreen(
 
                                     val message = when (result) {
                                         is SyncResult.Success -> "Синхронизация выполнена"
-                                        is SyncResult.Error -> "Ошибка синхронизации: ${result.message}"
+                                        is SyncResult.Error   -> "Ошибка синхронизации: ${result.message}"
                                     }
 
                                     Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                                } finally {
+                                    // В ЛЮБОМ случае отпускаем кнопку
+                                    isSyncing = false
                                 }
-
-
                             }
                         },
                         colors = dialogButtonColors(),
@@ -1022,6 +1749,7 @@ fun ScoreboardScreen(
                             fontSize = 16.sp
                         )
                     }
+
 
 
                     TextButton(
@@ -1045,6 +1773,8 @@ fun ScoreboardScreen(
                             setCurrentSeason(context, currentSeason)
                             (settingsRepository as SettingsRepositoryImpl).setServerUrl(serverUrl)
                             (settingsRepository as SettingsRepositoryImpl).setApiKey(apiKey)
+                            (settingsRepository as SettingsRepositoryImpl).setTelegramBotToken(telegramBotToken)
+                            (settingsRepository as SettingsRepositoryImpl).setTelegramChatId(telegramChatId)
                         }
                         showSettingsDialog = false
                     },
@@ -1052,7 +1782,8 @@ fun ScoreboardScreen(
                 ) {
                     Text("Закрыть", fontSize = 16.sp)
                 }
-            },
+            }
+            ,
             containerColor = DialogBackground,
             titleContentColor = DialogTitleColor,
             textContentColor = DialogTextColor
@@ -1074,6 +1805,166 @@ fun ScoreboardScreen(
                         .fillMaxWidth()
                         .verticalScroll(rememberScrollState())
                 ) {
+                    TextButton(
+                        onClick = {
+                            scope.launch {
+                                val result = raspiRepository.downloadRoster()
+
+                                if (!result.success || result.json == null) {
+                                    val msg = result.error?.let { "Ошибка загрузки состава: $it" }
+                                        ?: "Ошибка загрузки состава (пустой ответ)"
+                                    Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+                                    return@launch
+                                }
+
+                                try {
+                                    val jsonText = result.json
+                                    val array = org.json.JSONArray(jsonText)
+
+                                    val importedItems = mutableListOf<ImportedRosterItem>()
+                                    var detectedEventId: String? = null
+
+                                    for (i in 0 until array.length()) {
+                                        val obj = array.optJSONObject(i) ?: continue
+
+                                        val fullName = obj.optString("full_name").trim()
+                                        if (fullName.isEmpty()) continue
+
+                                        val teamRaw = obj.optString("team").trim().lowercase(Locale.getDefault())
+                                        if (teamRaw != "red" && teamRaw != "white") continue
+
+                                        val role = obj.optString("role", "").trim().ifEmpty { null }
+
+                                        val lineAny = obj.opt("line")
+                                        val line = lineAny?.toString()?.toIntOrNull()
+
+                                        val userId = obj.opt("user_id")
+                                            ?.toString()
+                                            ?.trim()
+                                            ?.ifEmpty { null }
+
+                                        val eventId = obj.opt("event_id")
+                                            ?.toString()
+                                            ?.trim()
+                                            ?.ifEmpty { null }
+
+                                        if (detectedEventId == null && eventId != null) {
+                                            detectedEventId = eventId
+                                        }
+
+                                        importedItems += ImportedRosterItem(
+                                            fullName = fullName,
+                                            team = teamRaw,
+                                            role = role,
+                                            line = line,
+                                            userId = userId,
+                                            eventId = eventId
+                                        )
+                                    }
+
+                                    if (importedItems.isEmpty()) {
+                                        Toast.makeText(
+                                            context,
+                                            "Файл состава пуст или не содержит корректных записей",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                        return@launch
+                                    }
+
+                                    // Проставляем внешний EventID (если он прилетел) и сохраняем в prefs
+                                    updateExternalEventId(detectedEventId)
+
+
+                                    // Строим карту базовых игроков по нормализованному имени
+                                    val baseByKey = basePlayers.associateBy { normalizeName(it.name) }.toMutableMap()
+                                    val updatedBase = basePlayers.toMutableList()
+
+                                    val redNames = mutableListOf<String>()
+                                    val whiteNames = mutableListOf<String>()
+                                    val unknown = mutableListOf<ImportedRosterItem>()
+
+                                    for (item in importedItems) {
+                                        val key = normalizeName(item.fullName)
+                                        val existing = baseByKey[key]
+
+                                        if (existing != null) {
+                                            var updated = existing
+
+                                            // Если у базового игрока ещё нет UserID, а из файла он пришёл — дописываем
+                                            if (updated.userId == null && item.userId != null) {
+                                                updated = updated.copy(userId = item.userId)
+                                            }
+
+                                            // TODO: при желании можно в будущем обновлять role/line
+
+                                            if (updated !== existing) {
+                                                val idx = updatedBase.indexOfFirst {
+                                                    normalizeName(it.name) == key
+                                                }
+                                                if (idx >= 0) {
+                                                    updatedBase[idx] = updated
+                                                }
+                                                baseByKey[key] = updated
+                                            }
+
+                                            // В состав кладём имя из базы (чтобы не разводить варианты написания)
+                                            when (item.team) {
+                                                "red" -> redNames += existing.name
+                                                "white" -> whiteNames += existing.name
+                                            }
+                                        } else {
+                                            // Такого игрока нет в базовом списке – будем спрашивать, что делать
+                                            unknown += item
+                                        }
+                                    }
+
+                                    // Обновляем базовый список (с уже проставленными userId) и сохраняем в prefs
+                                    basePlayers = updatedBase.sortedBy { it.name }
+                                    saveBasePlayers(prefs, basePlayers)
+
+                                    importedRedFromRoster = redNames.distinct()
+                                    importedWhiteFromRoster = whiteNames.distinct()
+
+                                    if (unknown.isEmpty()) {
+                                        // Все игроки известны – просто применяем состав
+                                        playersRedText = importedRedFromRoster.joinToString("\n")
+                                        playersWhiteText = importedWhiteFromRoster.joinToString("\n")
+
+                                        Toast.makeText(
+                                            context,
+                                            "Состав загружен: красные ${importedRedFromRoster.size}, белые ${importedWhiteFromRoster.size}",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    } else {
+                                        // Есть новые игроки – откроем отдельный диалог для решения
+                                        unknownRosterItems = unknown
+                                        showUnknownPlayersDialog = true
+
+                                        Toast.makeText(
+                                            context,
+                                            "Состав загружен, новые игроки: ${unknown.size}",
+                                            Toast.LENGTH_LONG
+                                        ).show()
+                                    }
+                                } catch (e: Exception) {
+                                    Toast.makeText(
+                                        context,
+                                        "Ошибка разбора состава: ${e.message}",
+                                        Toast.LENGTH_LONG
+                                    ).show()
+                                }
+                            }
+                        },
+
+
+                        colors = dialogButtonColors(),
+                        modifier = Modifier
+                            .align(Alignment.End)
+                            .padding(bottom = 8.dp)
+                    ) {
+                        Text("Загрузить состав с сервера", fontSize = 14.sp)
+                    }
+
                     Text(
                         text = "Красные:",
                         fontWeight = FontWeight.SemiBold,
@@ -1287,6 +2178,162 @@ fun ScoreboardScreen(
         )
     }
 
+    // --- ДИАЛОГ: НОВЫЕ ИГРОКИ ИЗ СОСТАВА ---
+
+    if (showUnknownPlayersDialog && unknownRosterItems.isNotEmpty()) {
+        // Для каждого игрока храним решение: true = добавить, false = игнорировать
+        val decisions = remember(unknownRosterItems) {
+            mutableStateMapOf<String, Boolean>().apply {
+                unknownRosterItems.forEach { item ->
+                    val key = item.userId ?: item.fullName
+                    this[key] = true   // по умолчанию всех добавляем
+                }
+            }
+        }
+
+        AlertDialog(
+            onDismissRequest = {
+                showUnknownPlayersDialog = false
+                unknownRosterItems = emptyList()
+            },
+            title = { Text("Новые игроки из состава", fontSize = 20.sp) },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 200.dp, max = 500.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        text = "Некоторые игроки из файла состава не найдены в базовой базе. Отметьте, кого добавить.",
+                        fontSize = 14.sp,
+                        color = DialogTextColor,
+                        modifier = Modifier.padding(bottom = 8.dp)
+                    )
+
+                    unknownRosterItems.forEach { item ->
+                        val key = item.userId ?: item.fullName
+                        val checked = decisions[key] ?: true
+
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 4.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Checkbox(
+                                checked = checked,
+                                onCheckedChange = { isChecked ->
+                                    decisions[key] = isChecked
+                                }
+                            )
+
+                            Column(
+                                modifier = Modifier.weight(1f)
+                            ) {
+                                Text(
+                                    text = item.fullName,
+                                    color = DialogTextColor,
+                                    fontSize = 16.sp,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = buildString {
+                                        append("Команда: ")
+                                        append(if (item.team == "red") "красные" else "белые")
+                                        item.userId?.let { id ->
+                                            append(", UserID: ")
+                                            append(id)
+                                        }
+                                    },
+                                    color = DialogTextColor,
+                                    fontSize = 12.sp
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        var newBase = basePlayers.toMutableList()
+
+                        // Кого решили добавить
+                        val toAdd = unknownRosterItems.filter { item ->
+                            val key = item.userId ?: item.fullName
+                            decisions[key] != false
+                        }
+
+                        toAdd.forEach { item ->
+                            val name = item.fullName.trim()
+
+                            // Добавляем в базовый список, если такого имени ещё нет
+                            if (newBase.none { it.name.equals(name, ignoreCase = true) }) {
+                                val playerInfo = PlayerInfo(
+                                    name = name,
+                                    role = PlayerRole.UNIVERSAL, // позже можно маппить из item.role
+                                    rating = 0,
+                                    userId = item.userId
+                                )
+                                newBase.add(playerInfo)
+                            }
+
+                            // И сразу добавляем в соответствующую команду
+                            when (item.team) {
+                                "red" -> {
+                                    importedRedFromRoster =
+                                        (importedRedFromRoster + name).distinct()
+                                }
+                                "white" -> {
+                                    importedWhiteFromRoster =
+                                        (importedWhiteFromRoster + name).distinct()
+                                }
+                            }
+                        }
+
+                        basePlayers = newBase.sortedBy { it.name }
+                        saveBasePlayers(prefs, basePlayers)
+
+                        // Обновляем текстовые составы целиком из импортированных списков
+                        playersRedText = importedRedFromRoster.joinToString("\n")
+                        playersWhiteText = importedWhiteFromRoster.joinToString("\n")
+
+                        showUnknownPlayersDialog = false
+                        unknownRosterItems = emptyList()
+
+                        Toast.makeText(
+                            context,
+                            "Состав загружен: красные ${importedRedFromRoster.size}, белые ${importedWhiteFromRoster.size}",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    },
+                    colors = dialogButtonColors()
+                ) {
+                    Text("Применить", fontSize = 16.sp)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        showUnknownPlayersDialog = false
+                        unknownRosterItems = emptyList()
+                    },
+                    colors = dialogButtonColors()
+                ) {
+                    Text("Отмена", fontSize = 16.sp)
+                }
+            },
+            containerColor = DialogBackground,
+            titleContentColor = DialogTitleColor,
+            textContentColor = DialogTextColor
+        )
+    }
+
+
+
+
     // --- ДИАЛОГ: ВВОД / РЕДАКТИРОВАНИЕ ГОЛА ---
 
     if (goalInputTeam != null && !gameFinished) {
@@ -1476,6 +2523,7 @@ fun ScoreboardScreen(
                         showLineupsDialog = false
                         resetGoalInput()
                         goalOptionsFor = null
+                        onFinalScreenshotRequested()
                     },
                     colors = dialogButtonColors()
                 ) {
@@ -1515,6 +2563,9 @@ fun ScoreboardScreen(
                         // 1. Сбросить локальное состояние (составы, голы, счёт, флаги)
                         resetGameState()
 
+                        // 1a. Очистить внешний EventID, чтобы не тянуть его в новую игру
+                        updateExternalEventId(null)
+
                         // 2. Сразу же сформировать НОВЫЙ JSON и отправить как активную игру
                         // (buildGameJson установит новый gameStartMillis и сделает файл для текущего сезона)
                         notifyGameJsonUpdated(isFinal = false)
@@ -1523,6 +2574,7 @@ fun ScoreboardScreen(
                         showNewGameConfirm = false
                         onNewGameStarted()
                     },
+
                     colors = dialogButtonColors()
                 ) {
                     Text("Да, новая игра", fontSize = 16.sp)
@@ -1549,6 +2601,7 @@ fun ScoreboardScreen(
 
         AlertDialog(
             onDismissRequest = {
+                showHistoryDialog = false
                 showHistoryDetailsDialog = false
                 historyDetailsText = ""
                 historySelectedEntry = null
@@ -1731,22 +2784,33 @@ fun ScoreboardScreen(
                         val entry = historySelectedEntry
                         val file = historySelectedFile
 
+                        // 1. Закрываем окна "Удалить?" и "Протокол"
+                        showDeleteGameConfirm = false
+                        showHistoryDetailsDialog = false
+
+                        // 2. Если есть что удалять — зовём Activity
                         if (entry != null) {
-                            onGameDeleted(entry.gameId, file)
+                            onGameDeleted(entry.gameId, file) { success ->
+                                if (success) {
+                                    // после успешного удаления дергаем ключ,
+                                    // диалог "Завершённые игры" останется открыт,
+                                    // но перечитает список из базы
+                                    historyRefreshKey++
+                                }
+                            }
                         }
 
+                        // 3. Чистим выбранную игру
                         historySelectedEntry = null
                         historySelectedFile = null
                         historyDetailsText = ""
-                        showDeleteGameConfirm = false
-                        showHistoryDetailsDialog = false
-                        showHistoryDialog = true
                     },
                     colors = dialogDangerButtonColors()
                 ) {
                     Text("Да, удалить", fontSize = 16.sp)
                 }
             },
+
             dismissButton = {
                 TextButton(
                     onClick = {

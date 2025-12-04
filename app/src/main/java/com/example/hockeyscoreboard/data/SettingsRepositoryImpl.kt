@@ -36,4 +36,32 @@ class SettingsRepositoryImpl(
     suspend fun setApiKey(key: String) = withContext(Dispatchers.IO) {
         prefs.edit().putString(KEY_API_KEY, key.trim()).apply()
     }
+    private val KEY_TELEGRAM_BOT_TOKEN = "telegram_bot_token"
+    private val KEY_TELEGRAM_CHAT_ID = "telegram_chat_id"
+
+
+    fun getTelegramBotToken(): String {
+        val prefs = context.getSharedPreferences("hockey_prefs", Context.MODE_PRIVATE)
+        return prefs.getString(KEY_TELEGRAM_BOT_TOKEN, "") ?: ""
+    }
+
+    fun setTelegramBotToken(token: String) {
+        val prefs = context.getSharedPreferences("hockey_prefs", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString(KEY_TELEGRAM_BOT_TOKEN, token)
+            .apply()
+    }
+
+    fun getTelegramChatId(): String {
+        val prefs = context.getSharedPreferences("hockey_prefs", Context.MODE_PRIVATE)
+        return prefs.getString(KEY_TELEGRAM_CHAT_ID, "") ?: ""
+    }
+
+    fun setTelegramChatId(chatId: String) {
+        val prefs = context.getSharedPreferences("hockey_prefs", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString(KEY_TELEGRAM_CHAT_ID, chatId)
+            .apply()
+    }
+
 }

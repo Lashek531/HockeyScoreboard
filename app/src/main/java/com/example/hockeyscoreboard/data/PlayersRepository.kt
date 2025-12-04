@@ -8,6 +8,8 @@ import org.json.JSONObject
 
 // Ключ для SharedPreferences
 const val PREF_PLAYERS_META = "players_meta_json"
+// Ключ для хранения внешнего EventID текущей активной игры
+const val PREF_ACTIVE_EVENT_ID = "active_event_id"
 
 // Базовый список игроков по умолчанию
 private val DefaultBasePlayers = listOf(
@@ -67,10 +69,32 @@ fun loadBasePlayers(prefs: SharedPreferences): List<PlayerInfo> {
             val obj = arr.optJSONObject(i) ?: continue
             val name = obj.optString("name").trim()
             if (name.isEmpty()) continue
+
             val roleStr = obj.optString("role", PlayerRole.UNIVERSAL.name)
-            val role = runCatching { PlayerRole.valueOf(roleStr) }.getOrDefault(PlayerRole.UNIVERSAL)
-            val rating = obj.optInt("rating", 0)
-            result += PlayerInfo(name, role, rating.coerceIn(0, 999))
+            val role = runCatching { PlayerRole.valueOf(roleStr) }
+                .getOrDefault(PlayerRole.UNIVERSAL)
+
+            val rating = obj.optInt("rating", 0).coerceIn(0, 999)
+
+            // Читаем userId как строку, независимо от того, было оно числом или строкой
+            val userId: String? = when {
+                obj.has("userId") -> {
+                    // наш новый формат: строковое поле "userId"
+                    obj.optString("userId").trim().ifEmpty { null }
+                }
+                obj.has("user_id") -> {
+                    // на будущее: если вдруг когда-то сохраняли с таким именем
+                    obj.optString("user_id").trim().ifEmpty { null }
+                }
+                else -> null
+            }
+
+            result += PlayerInfo(
+                name = name,
+                role = role,
+                rating = rating,
+                userId = userId
+            )
         }
         if (result.isEmpty()) {
             DefaultBasePlayers
@@ -88,6 +112,23 @@ fun loadBasePlayers(prefs: SharedPreferences): List<PlayerInfo> {
     }
 }
 
+/** Получить внешний EventID текущей активной игры (или null, если не задан). */
+fun getActiveEventId(prefs: SharedPreferences): String? =
+    prefs.getString(PREF_ACTIVE_EVENT_ID, null)
+
+/** Установить/очистить внешний EventID текущей активной игры. */
+fun setActiveEventId(prefs: SharedPreferences, value: String?) {
+    prefs.edit().apply {
+        if (value == null) {
+            remove(PREF_ACTIVE_EVENT_ID)
+        } else {
+            putString(PREF_ACTIVE_EVENT_ID, value)
+        }
+    }.apply()
+}
+
+
+
 /** Сохранение базового списка игроков в SharedPreferences (JSON). */
 fun saveBasePlayers(prefs: SharedPreferences, players: List<PlayerInfo>) {
     val arr = JSONArray()
@@ -96,6 +137,10 @@ fun saveBasePlayers(prefs: SharedPreferences, players: List<PlayerInfo>) {
         obj.put("name", p.name)
         obj.put("role", p.role.name)
         obj.put("rating", p.rating)
+        // Сохраняем userId, если он есть
+        p.userId?.let { id ->
+            obj.put("userId", id)
+        }
         arr.put(obj)
     }
     prefs.edit().putString(PREF_PLAYERS_META, arr.toString()).apply()

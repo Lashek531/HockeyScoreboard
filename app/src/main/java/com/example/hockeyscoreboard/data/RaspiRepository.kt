@@ -6,86 +6,114 @@ import java.io.InputStreamReader
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.text.Charsets
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
-data class RaspiResult(
-    val success: Boolean,
-    val errorMessage: String? = null
-)
-
-/**
- * Клиент к Raspberry Pi API.
- *
- * Использует спецификацию:
- *  - POST /api/upload-active-game
- *  - POST /api/upload-finished-game
- *  - POST /api/upload-finished-index
- *  - POST /api/upload-players-stats
- *  - POST /api/upload-root-index  (пока не вызываем, но есть)
- *  - POST /api/upload-json        (отладка, пишет в incoming/)
- *
- * Все запросы:
- *  - Content-Type: application/json; charset=utf-8
- *  - X-Api-Key: <секретный ключ>
- *
- * Ответ при успехе:
- *  { "status": "ok", "file": "relative/path/to/file.json" }
- */
-class RaspiRepository {
+class RaspiRepository(
+    private val settings: SettingsRepository
+) {
 
     companion object {
-        /** Базовый URL Malina (Flask/Nginx) */
-        private const val BASE_URL = "https://hockey.ch73210.keenetic.pro:8443"
-
-        /** API key, обязательный для всех эндпоинтов */
-        private const val API_KEY = "3vXjhEr1YvFzgL6gO2fc_"
-
         private const val CONNECT_TIMEOUT_MS = 10_000
         private const val READ_TIMEOUT_MS = 15_000
     }
 
-    // --- Публичные методы под каждый тип данных ---
+    // ----------------------------------------------------------
+    // ДИНАМИЧЕСКОЕ получение BASE_URL и API_KEY из настроек
+    // ----------------------------------------------------------
+    private suspend fun getBaseUrl(): String =
+        settings.getServerUrl().trimEnd('/')
 
-    /** Активная игра – пишется в active_game.json */
-    fun uploadActiveGame(json: String): RaspiResult =
+    private suspend fun getApiKey(): String =
+        settings.getApiKey()
+
+    // ----------------------------------------------------------
+    // Публичные API-вызовы
+    // ----------------------------------------------------------
+
+    suspend fun uploadActiveGame(json: String): RaspiResult =
         postJson("/api/upload-active-game", json)
 
-    /** Одна завершённая игра – finished/<season>/<id>.json */
-    fun uploadFinishedGame(json: String): RaspiResult =
+    suspend fun uploadFinishedGame(json: String): RaspiResult =
         postJson("/api/upload-finished-game", json)
 
-    /** Индекс завершённых игр сезона – finished/<season>/index.json */
-    fun uploadFinishedIndex(json: String): RaspiResult =
+    suspend fun uploadFinishedIndex(json: String): RaspiResult =
         postJson("/api/upload-finished-index", json)
 
-    /** Статистика игроков сезона – stats/<season>/players.json */
-    fun uploadPlayersStats(json: String): RaspiResult =
+    suspend fun uploadPlayersStats(json: String): RaspiResult =
         postJson("/api/upload-players-stats", json)
 
-    /** Глобальный корневой индекс сезонов – index.json (на будущее) */
-    fun uploadRootIndex(json: String): RaspiResult =
+    suspend fun uploadRootIndex(json: String): RaspiResult =
         postJson("/api/upload-root-index", json)
 
-    /** Универсальный логгер в incoming/ – для отладки */
-    fun uploadDebugJson(json: String): RaspiResult =
+    suspend fun uploadDebugJson(json: String): RaspiResult =
         postJson("/api/upload-json", json)
 
-    /** Удаление завершённой игры на сервере – finished/<season>/<id>.json */
-    fun deleteFinishedGame(season: String, gameId: String): RaspiResult {
+    suspend fun deleteFinishedGame(season: String, gameId: String): RaspiResult {
         val body = """
-        {
-          "season": "$season",
-          "id": "$gameId"
-        }
-    """.trimIndent()
-
+            {
+              "season": "$season",
+              "id": "$gameId"
+            }
+        """.trimIndent()
         return postJson("/api/delete-finished-game", body)
     }
 
-    // --- Базовый HTTP-клиент ---
+    // ----------------------------------------------------------
+    // Качаем состав (простой вариант: roster.json)
+    // ----------------------------------------------------------
 
-    private fun postJson(path: String, body: String): RaspiResult {
+    suspend fun downloadRoster(): RosterDownloadResult =
+        withContext(Dispatchers.IO) {
+            try {
+                val baseUrl = getBaseUrl()
+                val url = URL("$baseUrl/rosters/roster.json")
+
+                val conn = (url.openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = CONNECT_TIMEOUT_MS
+                    readTimeout = READ_TIMEOUT_MS
+                    setRequestProperty("Accept", "application/json")
+                }
+
+                val code = conn.responseCode
+                if (code !in 200..299) {
+                    return@withContext RosterDownloadResult(
+                        success = false,
+                        error = "HTTP $code при скачивании roster.json"
+                    )
+                }
+
+                val body = conn.inputStream.use { s ->
+                    BufferedReader(InputStreamReader(s, Charsets.UTF_8)).readText()
+                }
+
+                RosterDownloadResult(success = true, json = body)
+            } catch (e: Exception) {
+                RosterDownloadResult(
+                    success = false,
+                    error = e.toString()
+                )
+            }
+        }
+
+
+
+    data class RosterDownloadResult(
+        val success: Boolean,
+        val json: String? = null,
+        val error: String? = null
+    )
+
+    // ----------------------------------------------------------
+    // Базовый POST клиент
+    // ----------------------------------------------------------
+
+    private suspend fun postJson(path: String, body: String): RaspiResult {
         return try {
-            val url = URL(BASE_URL + path)
+            val baseUrl = getBaseUrl()
+            val apiKey = getApiKey()
+            val url = URL(baseUrl + path)
 
             val conn = (url.openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
@@ -96,10 +124,9 @@ class RaspiRepository {
 
                 setRequestProperty("Content-Type", "application/json; charset=utf-8")
                 setRequestProperty("Accept", "application/json")
-                setRequestProperty("X-Api-Key", API_KEY)
+                setRequestProperty("X-Api-Key", apiKey)
             }
 
-            // Тело запроса
             conn.outputStream.use { out ->
                 out.write(body.toByteArray(Charsets.UTF_8))
                 out.flush()
@@ -122,37 +149,38 @@ class RaspiRepository {
                 )
             }
 
-            // Ожидаем JSON вида {"status":"ok","file":"..."}
             val json = try {
                 JSONObject(responseBody)
-            } catch (e: Exception) {
+            } catch (_: Exception) {
                 return RaspiResult(
                     success = false,
                     errorMessage = "Некорректный JSON-ответ: $responseBody"
                 )
             }
 
-            val status = json.optString("status", "")
-            val file = json.optString("file", null)
-
-            if (status == "ok") {
-                RaspiResult(success = true, errorMessage = null)
+            if (json.optString("status") == "ok") {
+                RaspiResult(success = true)
             } else {
                 RaspiResult(
                     success = false,
-                    errorMessage = "Ответ сервера status='$status', file='$file'"
+                    errorMessage = "Ответ сервера не ok: $responseBody"
                 )
             }
+
         } catch (e: Exception) {
-            e.printStackTrace()
             RaspiResult(success = false, errorMessage = e.message)
         }
     }
 
     private fun readBody(conn: HttpURLConnection, code: Int): String? {
         val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        return stream?.use { s ->
-            BufferedReader(InputStreamReader(s, Charsets.UTF_8)).readText()
+        return stream?.use {
+            BufferedReader(InputStreamReader(it, Charsets.UTF_8)).readText()
         }
     }
 }
+
+data class RaspiResult(
+    val success: Boolean,
+    val errorMessage: String? = null
+)
