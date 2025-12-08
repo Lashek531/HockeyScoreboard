@@ -38,6 +38,7 @@ class SettingsRepositoryImpl(
     }
     private val KEY_TELEGRAM_BOT_TOKEN = "telegram_bot_token"
     private val KEY_TELEGRAM_CHAT_ID = "telegram_chat_id"
+    private val KEY_TELEGRAM_BOT_CHAT_ID = "telegram_bot_chat_id"
 
 
     fun getTelegramBotToken(): String {
@@ -63,5 +64,18 @@ class SettingsRepositoryImpl(
             .putString(KEY_TELEGRAM_CHAT_ID, chatId)
             .apply()
     }
+
+    fun getTelegramBotChatId(): String {
+        val prefs = context.getSharedPreferences("hockey_prefs", Context.MODE_PRIVATE)
+        return prefs.getString(KEY_TELEGRAM_BOT_CHAT_ID, "") ?: ""
+    }
+
+    fun setTelegramBotChatId(chatId: String) {
+        val prefs = context.getSharedPreferences("hockey_prefs", Context.MODE_PRIVATE)
+        prefs.edit()
+            .putString(KEY_TELEGRAM_BOT_CHAT_ID, chatId)
+            .apply()
+    }
+
 
 }

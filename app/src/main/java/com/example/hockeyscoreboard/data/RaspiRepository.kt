@@ -49,6 +49,12 @@ class RaspiRepository(
     suspend fun uploadDebugJson(json: String): RaspiResult =
         postJson("/api/upload-json", json)
 
+    suspend fun uploadSettings(json: String): RaspiResult =
+        postJson("/api/upload-settings", json)
+
+    suspend fun uploadBaseRoster(json: String): RaspiResult =
+        postJson("/api/upload-base-roster", json)
+
     suspend fun deleteFinishedGame(season: String, gameId: String): RaspiResult {
         val body = """
             {

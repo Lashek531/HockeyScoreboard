@@ -59,6 +59,9 @@ import java.io.DataOutputStream
 import java.net.HttpURLConnection
 import java.net.URL
 import androidx.compose.runtime.mutableStateMapOf
+import org.json.JSONObject
+import org.json.JSONArray
+
 
 
 
@@ -235,6 +238,11 @@ fun loadActiveGameSnapshotOrNull(context: Context): ActiveGameSnapshot? {
 }
 
 
+// --- Корень локальной базы hockey-json на устройстве ---
+fun getLocalDbRoot(context: Context): File {
+    val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
+    return File(baseDir, "hockey-json")
+}
 
 
 
@@ -280,18 +288,24 @@ fun ScoreboardScreen(
     var apiKey by remember { mutableStateOf("") }
     var telegramBotToken by remember { mutableStateOf("") }
     var telegramChatId by remember { mutableStateOf("") }
+    var telegramBotChatId by remember { mutableStateOf("") }
+
+    // Снапшот значений настроек на момент открытия диалога
+    var initialSeason by remember { mutableStateOf("") }
+    var initialServerUrl by remember { mutableStateOf("") }
+    var initialApiKey by remember { mutableStateOf("") }
+    var initialTelegramBotToken by remember { mutableStateOf("") }
+    var initialTelegramChatId by remember { mutableStateOf("") }
+    var initialTelegramBotChatId by remember { mutableStateOf("") }
+
+    // Диалог подтверждения изменения настроек
+    var showSettingsConfirmDialog by remember { mutableStateOf(false) }
 
 
 
 
 
 
-    LaunchedEffect(Unit) {
-        serverUrl = settingsRepository.getServerUrl()
-        apiKey = settingsRepository.getApiKey()
-        telegramBotToken = (settingsRepository as SettingsRepositoryImpl).getTelegramBotToken()
-        telegramChatId = (settingsRepository as SettingsRepositoryImpl).getTelegramChatId()
-    }
 
 
 
@@ -416,6 +430,21 @@ fun ScoreboardScreen(
 
 
     var gameFinished by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        serverUrl = settingsRepository.getServerUrl()
+        apiKey = settingsRepository.getApiKey()
+        telegramBotToken = (settingsRepository as SettingsRepositoryImpl).getTelegramBotToken()
+        telegramChatId = (settingsRepository as SettingsRepositoryImpl).getTelegramChatId()
+        telegramBotChatId = (settingsRepository as SettingsRepositoryImpl).getTelegramBotChatId()
+
+        // При первом запуске можно сразу считать эти значения как "исходные"
+        initialSeason = currentSeason
+        initialServerUrl = serverUrl
+        initialApiKey = apiKey
+        initialTelegramBotToken = telegramBotToken
+        initialTelegramChatId = telegramChatId
+        initialTelegramBotChatId = telegramBotChatId
+    }
 
 
 
@@ -755,6 +784,87 @@ fun ScoreboardScreen(
         return fileName to root.toString(2)
     }
 
+    /**
+     * Формируем JSON настроек приложения в формате app_settings.json
+     * для выгрузки на Raspberry Pi (/settings/app_settings.json).
+     *
+     * Всё, что есть в окне настроек, уходит в файл:
+     *  - currentSeason       — текущий сезон
+     *  - serverUrl           — URL сервера
+     *  - apiKey              — API-ключ
+     *  - telegramBotToken    — токен бота
+     *  - telegramHockeyChatId (PokeChat)
+     *  - telegramBotChatId    (ExternalBot)
+     */
+    fun buildAppSettingsJson(): String {
+        val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
+        val nowIso = isoFormat.format(Date())
+
+        val root = org.json.JSONObject().apply {
+            put("version", 1)
+            put("updatedAt", nowIso)
+
+            // Базовые игровые настройки — пока константы
+            put("periodDurationMinutes", 20)
+            put("intermissionMinutes", 5)
+            put("language", "ru")
+            put("theme", "dark")
+            put("soundEnabled", true)
+
+            // Основные настройки подключения
+            put("currentSeason", currentSeason.trim())
+            put("serverUrl", serverUrl.trim())
+            put("apiKey", apiKey.trim())
+
+            // Telegram-настройки
+            put("telegramBotToken", telegramBotToken.trim())
+            // PokeChat — хоккейный чат
+            put("telegramHockeyChatId", telegramChatId.trim())
+            // ExternalBot — чат бота
+            put("telegramBotChatId", telegramBotChatId.trim())
+        }
+
+        return root.toString(2)
+    }
+
+    // Сохранить настройки локально и выгрузить их на Raspberry
+    fun performSettingsSaveAndUpload() {
+        scope.launch {
+            // 1. Сохраняем в SharedPreferences
+            setCurrentSeason(context, currentSeason)
+            (settingsRepository as SettingsRepositoryImpl).setServerUrl(serverUrl)
+            (settingsRepository as SettingsRepositoryImpl).setApiKey(apiKey)
+            (settingsRepository as SettingsRepositoryImpl).setTelegramBotToken(telegramBotToken)
+            (settingsRepository as SettingsRepositoryImpl).setTelegramChatId(telegramChatId)
+            (settingsRepository as SettingsRepositoryImpl).setTelegramBotChatId(telegramBotChatId)
+
+            // 2. Формируем JSON настроек
+            val json = buildAppSettingsJson()
+
+            // 3. Отправляем на сервер
+            val result = withContext(Dispatchers.IO) {
+                raspiRepository.uploadSettings(json)
+            }
+
+            // 4. Закрываем диалоги
+            showSettingsConfirmDialog = false
+            showSettingsDialog = false
+
+            // 5. Сообщение пользователю
+            val message = if (result.success) {
+                "Настройки сохранены и выгружены"
+            } else {
+                "Ошибка выгрузки настроек: ${result.errorMessage ?: "неизвестна"}"
+            }
+
+            Toast.makeText(
+                context,
+                message,
+                Toast.LENGTH_LONG
+            ).show()
+        }
+    }
+
 
     fun saveExternalEventJson(gameId: String) {
         // База hockey-json
@@ -1011,6 +1121,137 @@ fun ScoreboardScreen(
         return file
     }
 
+    fun getCurrentIsoTimestamp(): String {
+        return java.time.LocalDateTime.now().toString()
+    }
+
+
+    fun buildBaseRosterJson(): String {
+        val root = JSONObject()
+
+        root.put("version", 1)
+        root.put("updatedAt", SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault()).format(Date()))
+
+        val playersArr = JSONArray()
+
+        basePlayers.sortedBy { it.name }.forEach { p ->
+            val obj = JSONObject()
+
+            // Требуемый сервером формат
+            obj.put("user_id", p.userId?.toLongOrNull() ?: JSONObject.NULL)
+            obj.put("full_name", p.name)
+
+            obj.put("role", when (p.role) {
+                PlayerRole.DEFENDER -> "def"
+                PlayerRole.FORWARD  -> "fwd"
+                PlayerRole.UNIVERSAL -> "uni"
+            })
+
+            // Команда всегда null — сервер так требует
+            obj.put("team", JSONObject.NULL)
+
+            obj.put("rating", p.rating)
+
+            playersArr.put(obj)
+        }
+
+        root.put("players", playersArr)
+        return root.toString(2)
+    }
+
+
+    fun saveBaseRosterJsonToFile(json: String): File {
+        val dbRoot = getLocalDbRoot(context)
+        if (!dbRoot.exists()) dbRoot.mkdirs()
+
+        val baseRosterDir = File(dbRoot, "base_roster")
+        if (!baseRosterDir.exists()) baseRosterDir.mkdirs()
+
+        val file = File(baseRosterDir, "base_players.json")
+        file.writeText(json, Charsets.UTF_8)
+        return file
+    }
+
+
+
+
+    suspend fun applyAppSettingsFromServer() {
+        val dbRoot = getLocalDbRoot(context)
+        val settingsDir = File(dbRoot, "settings")
+        val settingsFile = File(settingsDir, "app_settings.json")
+        if (!settingsFile.exists()) return
+
+        val text = withContext(Dispatchers.IO) {
+            settingsFile.readText(Charsets.UTF_8)
+        }
+
+        try {
+            val root = org.json.JSONObject(text)
+
+            val tokenFromServer = root.optString("telegramBotToken", "").trim()
+            val hockeyChatFromServer = root.optString("telegramHockeyChatId", "").trim()
+            val botChatFromServer = root.optString("telegramBotChatId", "").trim()
+
+            // Обновляем репозиторий и локальное состояние там, где значения не пустые
+            val impl = settingsRepository as SettingsRepositoryImpl
+
+            if (tokenFromServer.isNotEmpty()) {
+                impl.setTelegramBotToken(tokenFromServer)
+                telegramBotToken = tokenFromServer
+            }
+
+            if (hockeyChatFromServer.isNotEmpty()) {
+                impl.setTelegramChatId(hockeyChatFromServer)
+                telegramChatId = hockeyChatFromServer
+            }
+
+            if (botChatFromServer.isNotEmpty()) {
+                impl.setTelegramBotChatId(botChatFromServer)
+                telegramBotChatId = botChatFromServer
+            }
+
+            // При желании сюда же позже добавим импорт периода / перерыва / языка / темы
+
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+
+
+
+
+    fun saveAppSettingsJsonToFile(json: String): File {
+        val dbRoot = getLocalDbRoot(context)
+        if (!dbRoot.exists()) dbRoot.mkdirs()
+
+        val settingsDir = File(dbRoot, "settings")
+        if (!settingsDir.exists()) settingsDir.mkdirs()
+
+        val file = File(settingsDir, "app_settings.json")
+        file.writeText(json, Charsets.UTF_8)
+        return file
+    }
+
+
+    suspend fun uploadAppSettingsToServer() {
+        val json = buildAppSettingsJson()
+        saveAppSettingsJsonToFile(json)
+
+        val result = raspiRepository.uploadSettings(json)
+
+        if (!result.success) {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(
+                    context,
+                    "Ошибка выгрузки настроек приложения: ${result.errorMessage ?: "неизвестно"}",
+                    Toast.LENGTH_LONG
+                ).show()
+            }
+        }
+    }
+
+
     // Сохранение active_game.json (может быть как незавершённой, так и завершённой)
     fun saveActiveGameJsonToFile(isFinal: Boolean): File {
         val (_, json) = buildGameJson(isFinal)
@@ -1026,28 +1267,30 @@ fun ScoreboardScreen(
 
     fun sendExternalEventToTelegramIfConfigured(gameId: String) {
         val token = telegramBotToken.trim()
-        val chat = telegramChatId.trim()
+        val botChat = telegramBotChatId.trim()         // ExternalTelegramBot.id
 
-        // Если настройки не заданы – тихо выходим
-        if (token.isEmpty() || chat.isEmpty()) return
+        // Если токен пустой или не задан чат бота – ничего не отправляем
+        if (token.isEmpty() || botChat.isEmpty()) return
 
         val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
         val dbRoot = File(baseDir, "hockey-json")
+        if (!dbRoot.exists()) dbRoot.mkdirs()
 
-        // Отдельная папка под формат для внешнего API
+        // Папка под формат внешнего API
         val exportDirApi = File(dbRoot, "external-events-api")
+        if (!exportDirApi.exists()) exportDirApi.mkdirs()
 
-        // event_id = внешний, если есть, иначе наш gameId
-        val eventIdValue: String =
-            externalEventId?.takeIf { it.isNotBlank() } ?: gameId
+        // event_id как INT (ровно так же, как в saveExternalEventJsonForServer)
+        val eventIdStr = externalEventId?.takeIf { it.isNotBlank() } ?: gameId
+        val eventIdInt = eventIdStr.toIntOrNull() ?: 0
 
-        // Ищем файл по новой схеме имени: result_<event_id>.json
-        val apiFile = File(exportDirApi, "result_${eventIdValue}.json")
+        // Ищем файл по схеме result_<event_id>.json
+        val apiFile = File(exportDirApi, "result_${eventIdInt}.json")
 
         if (!apiFile.exists()) {
             Toast.makeText(
                 context,
-                "Файл статистики для Telegram не найден",
+                "Файл статистики для Telegram не найден (result_${eventIdInt}.json)",
                 Toast.LENGTH_LONG
             ).show()
             return
@@ -1056,9 +1299,9 @@ fun ScoreboardScreen(
         scope.launch {
             try {
                 withContext(Dispatchers.IO) {
-                    fun sendFileToTelegram(file: File) {
+                    fun sendFileToTelegram(chatId: String, file: File) {
                         val url = URL("https://api.telegram.org/bot$token/sendDocument")
-                        val boundary = "HSB-${System.currentTimeMillis()}-${file.name}"
+                        val boundary = "HSB-${System.currentTimeMillis()}-${file.name}-$chatId"
                         val lineEnd = "\r\n"
                         val twoHyphens = "--"
 
@@ -1079,9 +1322,9 @@ fun ScoreboardScreen(
                             output.writeBytes(
                                 "Content-Disposition: form-data; name=\"chat_id\"$lineEnd$lineEnd"
                             )
-                            output.writeBytes(chat + lineEnd)
+                            output.writeBytes(chatId + lineEnd)
 
-                            // document
+                            // document (наш JSON)
                             output.writeBytes(twoHyphens + boundary + lineEnd)
                             output.writeBytes(
                                 "Content-Disposition: form-data; name=\"document\"; filename=\"${file.name}\"$lineEnd"
@@ -1104,18 +1347,18 @@ fun ScoreboardScreen(
 
                         val code = connection.responseCode
                         if (code != HttpURLConnection.HTTP_OK) {
-                            throw RuntimeException("HTTP $code (${file.name})")
+                            throw RuntimeException("HTTP $code (${file.name}) chat=$chatId")
                         }
                     }
 
-                    // Отправляем только новый файл для внешнего API
-                    sendFileToTelegram(apiFile)
+                    // Отправляем файл ТОЛЬКО в чат ExternalTelegramBot.id
+                    sendFileToTelegram(botChat, apiFile)
                 }
 
                 withContext(Dispatchers.Main) {
                     Toast.makeText(
                         context,
-                        "Статистика отправлена в Telegram",
+                        "Статистика отправлена в Telegram (ExternalTelegramBot)",
                         Toast.LENGTH_SHORT
                     ).show()
                 }
@@ -1182,7 +1425,27 @@ fun ScoreboardScreen(
         }
     }
 
+    // Выгрузка базового списка игроков на Raspberry Pi
+    suspend fun uploadBaseRosterToServer() {
+        val json =
+            buildBaseRosterJson()
 
+        // Локальная запись (опционально — но полезно)
+        saveBaseRosterJsonToFile(json)
+
+        // POST /api/upload-base-roster
+        val result = withContext(Dispatchers.IO) {
+            raspiRepository.uploadBaseRoster(json)
+        }
+
+        val msg = if (result.success) {
+            "Базовый список игроков выгружен"
+        } else {
+            "Ошибка выгрузки базового списка игроков: ${result.errorMessage ?: "неизвестна"}"
+        }
+
+        Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
+    }
 
     fun commitGoalIfPossible() {
         if (gameFinished) return
@@ -1401,20 +1664,75 @@ fun ScoreboardScreen(
                     TextButton(
                         onClick = {
                             showActionsMenu = false
+
+                            // Зафиксируем исходные значения настроек на момент открытия
+                            initialSeason = currentSeason
+                            initialServerUrl = serverUrl
+                            initialApiKey = apiKey
+                            initialTelegramBotToken = telegramBotToken
+                            initialTelegramChatId = telegramChatId
+                            initialTelegramBotChatId = telegramBotChatId
+
                             showSettingsDialog = true
                         },
                         colors = dialogButtonColors()
                     ) {
                         Text("Настройки", fontSize = 16.sp)
                     }
+
                 }
             },
             confirmButton = {
                 TextButton(
-                    onClick = { showActionsMenu = false },
+                    onClick = {
+                        // Меню просто закрываем, без какой-либо логики настроек
+                        showActionsMenu = false
+                    },
                     colors = dialogButtonColors()
                 ) {
                     Text("Закрыть", fontSize = 16.sp)
+                }
+            },
+
+            containerColor = DialogBackground,
+            titleContentColor = DialogTitleColor,
+            textContentColor = DialogTextColor
+        )
+    }
+
+    // --- ДИАЛОГ: ПОДТВЕРЖДЕНИЕ ИЗМЕНЕНИЯ НАСТРОЕК ---
+
+    if (showSettingsConfirmDialog) {
+        AlertDialog(
+            onDismissRequest = { showSettingsConfirmDialog = false },
+            title = { Text("Подтверждение", fontSize = 20.sp) },
+            text = {
+                Text(
+                    text = "Вы изменили настройки, вы уверены в их правильности?",
+                    color = DialogTextColor,
+                    fontSize = 16.sp
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        // Сохраняем и выгружаем
+                        performSettingsSaveAndUpload()
+                    },
+                    colors = dialogButtonColors()
+                ) {
+                    Text("Да", fontSize = 16.sp)
+                }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        // Просто закрываем диалог подтверждения, настройки остаются открыты
+                        showSettingsConfirmDialog = false
+                    },
+                    colors = dialogButtonColors()
+                ) {
+                    Text("Нет", fontSize = 16.sp)
                 }
             },
             containerColor = DialogBackground,
@@ -1422,6 +1740,7 @@ fun ScoreboardScreen(
             textContentColor = DialogTextColor
         )
     }
+
 
     // --- ДИАЛОГ: БАЗОВЫЙ СПИСОК ИГРОКОВ ---
 
@@ -1485,6 +1804,7 @@ fun ScoreboardScreen(
                                     .padding(vertical = 2.dp),
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
+                                // Имя
                                 Text(
                                     text = player.name,
                                     modifier = Modifier.weight(1f),
@@ -1494,6 +1814,7 @@ fun ScoreboardScreen(
                                     fontSize = 16.sp
                                 )
 
+                                // Роль (циклический переключатель)
                                 val roleSymbol = when (player.role) {
                                     PlayerRole.DEFENDER -> "🛡"
                                     PlayerRole.FORWARD -> "🎯"
@@ -1523,6 +1844,7 @@ fun ScoreboardScreen(
                                     Text(roleSymbol, fontSize = 14.sp)
                                 }
 
+                                // Рейтинг
                                 var ratingText by remember(player.name) {
                                     mutableStateOf(
                                         if (player.rating == 0) "" else player.rating.toString()
@@ -1572,6 +1894,54 @@ fun ScoreboardScreen(
 
                                 Spacer(modifier = Modifier.width(4.dp))
 
+                                // UserID (внешний ID игрока)
+                                var userIdText by remember(player.name + "_uid") {
+                                    mutableStateOf(player.userId ?: "")
+                                }
+
+                                Box(
+                                    modifier = Modifier
+                                        .width(90.dp)
+                                        .height(24.dp),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    BasicTextField(
+                                        value = userIdText,
+                                        onValueChange = { text ->
+                                            userIdText = text
+
+                                            val cleaned = text.trim().ifEmpty { null }
+
+                                            basePlayers = basePlayers
+                                                .map { p ->
+                                                    if (p.name == player.name) p.copy(userId = cleaned) else p
+                                                }
+                                                .sortedBy { it.name }
+                                        },
+                                        singleLine = true,
+                                        keyboardOptions = KeyboardOptions(
+                                            keyboardType = KeyboardType.Number
+                                        ),
+                                        textStyle = MaterialTheme.typography.bodySmall.copy(
+                                            fontSize = 12.sp,
+                                            color = DialogTitleColor,
+                                            textAlign = TextAlign.Center
+                                        ),
+                                        modifier = Modifier.fillMaxSize(),
+                                        decorationBox = { innerTextField ->
+                                            Box(
+                                                modifier = Modifier.fillMaxSize(),
+                                                contentAlignment = Alignment.Center
+                                            ) {
+                                                innerTextField()
+                                            }
+                                        }
+                                    )
+                                }
+
+                                Spacer(modifier = Modifier.width(4.dp))
+
+                                // Удалить игрока
                                 IconButton(
                                     onClick = {
                                         val nameToRemove = player.name
@@ -1587,25 +1957,25 @@ fun ScoreboardScreen(
                                 }
                             }
                         }
+
                 }
             },
             confirmButton = {
                 TextButton(
                     onClick = {
+                        // 1. Локально сохраняем в SharedPreferences
                         saveBasePlayers(prefs, basePlayers)
                         showBasePlayersDialog = false
+
+                        // 2. Выгружаем base_players.json на сервер (в фоне)
+                        scope.launch {
+                            uploadBaseRosterToServer()
+                        }
+
                     },
                     colors = dialogButtonColors()
                 ) {
                     Text("Сохранить", fontSize = 16.sp)
-                }
-            },
-            dismissButton = {
-                TextButton(
-                    onClick = { showBasePlayersDialog = false },
-                    colors = dialogButtonColors()
-                ) {
-                    Text("Отмена", fontSize = 16.sp)
                 }
             },
             containerColor = DialogBackground,
@@ -1695,11 +2065,28 @@ fun ScoreboardScreen(
                             unfocusedBorderColor = Color(0xFF455A64)
                         )
                     )
+                    // НОВОЕ поле: чат для бота (Chat)
+                    OutlinedTextField(
+                        value = telegramBotChatId,
+                        onValueChange = { telegramBotChatId = it },
+                        label = { Text("External Telegram Bot ID") },
+                        singleLine = true,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = DialogTitleColor,
+                            unfocusedTextColor = DialogTitleColor,
+                            cursorColor = DialogTitleColor,
+                            focusedBorderColor = Color(0xFF546E7A),
+                            unfocusedBorderColor = Color(0xFF455A64)
+                        )
+                    )
 
                     OutlinedTextField(
                         value = telegramChatId,
                         onValueChange = { telegramChatId = it },
-                        label = { Text("Telegram Chat ID / Channel") },
+                        label = { Text("Hockey Chat ID") },
                         singleLine = true,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -1725,8 +2112,11 @@ fun ScoreboardScreen(
                                     val result = syncRepository.syncDatabase()
 
                                     if (result is SyncResult.Success) {
-                                        // Файлы обновлены – пересобираем индекс целиком
+                                        // 1. Файлы обновлены – пересобираем индекс игр
                                         rebuildGamesIndexFromFilesystem()
+
+                                        // 2. Импортируем настройки приложения из settings/app_settings.json
+                                        applyAppSettingsFromServer()
                                     }
 
                                     val message = when (result) {
@@ -1752,6 +2142,7 @@ fun ScoreboardScreen(
 
 
 
+
                     TextButton(
                         onClick = {
                             showSettingsDialog = false
@@ -1769,21 +2160,33 @@ fun ScoreboardScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        scope.launch {
-                            setCurrentSeason(context, currentSeason)
-                            (settingsRepository as SettingsRepositoryImpl).setServerUrl(serverUrl)
-                            (settingsRepository as SettingsRepositoryImpl).setApiKey(apiKey)
-                            (settingsRepository as SettingsRepositoryImpl).setTelegramBotToken(telegramBotToken)
-                            (settingsRepository as SettingsRepositoryImpl).setTelegramChatId(telegramChatId)
+                        // Проверяем, есть ли реальные изменения
+                        val changed =
+                            currentSeason != initialSeason ||
+                                    serverUrl != initialServerUrl ||
+                                    apiKey != initialApiKey ||
+                                    telegramBotToken != initialTelegramBotToken ||
+                                    telegramChatId != initialTelegramChatId ||
+                                    telegramBotChatId != initialTelegramBotChatId
+
+                        if (changed) {
+                            // Показываем диалог подтверждения изменений
+                            showSettingsConfirmDialog = true
+                        } else {
+                            // Ничего не менялось — просто закрываем настройки без выгрузки и тоста
+                            showSettingsDialog = false
                         }
-                        showSettingsDialog = false
                     },
                     colors = dialogButtonColors()
                 ) {
                     Text("Закрыть", fontSize = 16.sp)
                 }
-            }
-            ,
+            },
+
+
+
+
+
             containerColor = DialogBackground,
             titleContentColor = DialogTitleColor,
             textContentColor = DialogTextColor
@@ -2835,3 +3238,7 @@ fun PreviewScoreboard() {
         ScoreboardScreen()
     }
 }
+
+
+
+
