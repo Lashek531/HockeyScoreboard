@@ -349,80 +349,7 @@ fun buildTopBombersRows(stats: Map<String, PlayerStats>): List<PlayerStatsRow> {
     }
 }
 
-/**
- * Сканируем локальную папку games и добавляем в Room все json-файлы,
- * которых ещё нет в таблице games.
- *
- * Возвращает количество ДОБАВЛЕННЫХ (новых) игр.
- */
-fun syncGamesFolderToRoom(
-    context: Context,
-    gameDao: GameDao
-): Int {
-    val filesOnDisk = listSavedGames(context)
-    if (filesOnDisk.isEmpty()) return 0
 
-    // Уже известные игры в Room по имени файла
-    val existingByFileName = gameDao.getAllGames().associateBy { it.fileName }
-
-    var addedCount = 0
-
-    // Формат даты такой же, как в buildGameJson()
-    val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
-
-    for (file in filesOnDisk) {
-        // Если игра с таким именем файла уже есть в Room — пропускаем
-        if (existingByFileName.containsKey(file.name)) continue
-
-        try {
-            val text = file.readText(Charsets.UTF_8)
-            val root = JSONObject(text)
-
-            // gameId: либо из json, либо из имени файла без .json
-            val gameId = root.optString(
-                "gameId",
-                file.name.removeSuffix(".json")
-
-            )
-            val season = root.optString("season", "25-26")
-            // Дата начала игры
-            val dateStr = root.optString("date", null)
-            val startedAt = if (!dateStr.isNullOrBlank()) {
-                try {
-                    isoFormat.parse(dateStr)?.time ?: file.lastModified()
-                } catch (_: Exception) {
-                    file.lastModified()
-                }
-            } else {
-                file.lastModified()
-            }
-
-            // Счёт из finalScore
-            // Счёт из finalScore
-            val finalScoreObj = root.optJSONObject("finalScore")
-            val redScore = finalScoreObj?.optInt("RED", 0) ?: 0
-            val whiteScore = finalScoreObj?.optInt("WHITE", 0) ?: 0
-
-            val entry = GameEntry(
-                gameId = gameId,
-                season = season,
-                fileName = file.name,
-                localPath = file.absolutePath,
-                startedAt = startedAt,
-                finishedAt = null,
-                redScore = redScore,
-                whiteScore = whiteScore
-            )
-
-            gameDao.upsertGame(entry)
-            addedCount++
-        } catch (_: Exception) {
-            // битый или чужой файл — просто пропускаем
-        }
-    }
-
-    return addedCount
-}
 /**
  * Пытаемся вытащить сезон из пути к файлу, если в JSON поля season нет.
  * Ищем кусок вида "25-26", "24-25" и т.п. в сегментах пути.
@@ -442,17 +369,29 @@ private fun collectJsonFilesRecursively(root: File, out: MutableList<File>) {
     for (f in children) {
         if (f.isDirectory) {
             collectJsonFilesRecursively(f, out)
-        } else if (f.isFile && f.name.endsWith(".json", ignoreCase = true)) {
+        } else if (
+            f.isFile &&
+            f.name.endsWith(".json", ignoreCase = true) &&
+            !f.name.equals("index.json", ignoreCase = true)
+        ) {
             out += f
         }
     }
 }
+
+
+
 
 /**
  * Преобразование одного JSON-файла матча в GameEntry для Room.
  * Если файл битый или структура неожиданная — возвращаем null.
  */
 private fun parseGameEntryFromJsonFile(file: File): GameEntry? {
+    // Явно игнорируем индексные файлы
+    if (file.name.equals("index.json", ignoreCase = true)) {
+        return null
+    }
+
     val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
 
     return try {
@@ -517,45 +456,28 @@ private fun parseGameEntryFromJsonFile(file: File): GameEntry? {
     }
 }
 
-/**
- * Полная пересборка таблицы games по всем доступным JSON-файлам.
- *
- * 1. Очищает таблицу games.
- * 2. Ищет файлы:
- *    - в папке .../files/games
- *    - в папке .../files/hockey-json/finished и всех её подпапках (по сезонам).
- * 3. Для каждого файла читает JSON и создаёт GameEntry.
- *
- * Возвращает количество успешно импортированных игр.
- */
+
+
 fun rebuildGamesIndexFromAllSources(
     context: Context,
     gameDao: GameDao
 ): Int {
-    val baseDir = context.getExternalFilesDir(null) ?: return 0
-
-    // Старый формат: .../files/games
-    val legacyGamesDir = File(baseDir, "games")
+    val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
 
     // Новый формат: .../files/hockey-json/finished/<season>/<files.json>
     val hockeyJsonFinishedRoot = File(File(baseDir, "hockey-json"), "finished")
 
+    // Если базы нет — просто чистим индекс и выходим
+    if (!hockeyJsonFinishedRoot.exists() || !hockeyJsonFinishedRoot.isDirectory) {
+        gameDao.deleteAll()
+        return 0
+    }
+
     val allFiles = mutableListOf<File>()
 
-    // 1) Добавляем json-ы из папки games (если есть)
-    if (legacyGamesDir.exists() && legacyGamesDir.isDirectory) {
-        val files = legacyGamesDir.listFiles { f ->
-            f.isFile && f.name.endsWith(".json", ignoreCase = true)
-        } ?: emptyArray()
-        allFiles += files
-    }
+    // Собираем все *.json (кроме index.json) рекурсивно
+    collectJsonFilesRecursively(hockeyJsonFinishedRoot, allFiles)
 
-    // 2) Добавляем json-ы из hockey-json/finished/** (все сезоны)
-    if (hockeyJsonFinishedRoot.exists() && hockeyJsonFinishedRoot.isDirectory) {
-        collectJsonFilesRecursively(hockeyJsonFinishedRoot, allFiles)
-    }
-
-    // Если файлов нет — просто очищаем таблицу и выходим
     if (allFiles.isEmpty()) {
         gameDao.deleteAll()
         return 0
@@ -579,4 +501,3 @@ fun rebuildGamesIndexFromAllSources(
 
     return imported
 }
-

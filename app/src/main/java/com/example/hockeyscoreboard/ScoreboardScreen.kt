@@ -61,6 +61,8 @@ import java.net.URL
 import androidx.compose.runtime.mutableStateMapOf
 import org.json.JSONObject
 import org.json.JSONArray
+import com.example.hockeyscoreboard.data.rebuildGamesIndexFromAllSources
+
 
 
 
@@ -539,77 +541,6 @@ fun ScoreboardScreen(
 
 
 
-    fun rebuildGamesIndexFromFilesystem() {
-        // база там же, где мы только что синкнули ZIP
-        val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
-        val dbRoot = File(baseDir, "hockey-json")
-        val finishedRoot = File(dbRoot, "finished")
-
-        // если базы нет вообще — просто чистим индекс
-        if (!finishedRoot.exists() || !finishedRoot.isDirectory) {
-            gameDao.deleteAll()
-            return
-        }
-
-        // сначала полностью очищаем индекс
-        gameDao.deleteAll()
-
-        // проходим по всем сезонам: finished/<season>/*.json
-        finishedRoot.listFiles()?.forEach { seasonDir ->
-            if (!seasonDir.isDirectory) return@forEach
-            val season = seasonDir.name
-
-            seasonDir.listFiles { f ->
-                f.isFile &&
-                        f.name.endsWith(".json") &&
-                        f.name != "index.json"
-            }?.forEach { file ->
-                try {
-                    val text = file.readText(Charsets.UTF_8)
-                    val json = org.json.JSONObject(text)
-
-                    val baseId = json.optString(
-                        "id",
-                        file.name.removeSuffix(".json")
-                    )
-
-                    val dateStr = json.optString("date", "")
-                    val finalScoreObj = json.optJSONObject("finalScore")
-
-                    val redScore = finalScoreObj?.optInt("RED", 0) ?: 0
-                    val whiteScore = finalScoreObj?.optInt("WHITE", 0) ?: 0
-
-                    // пытаемся вытащить timestamp из поля date
-                    val startedAt = try {
-                        if (dateStr.isNotBlank()) {
-                            val fmt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault())
-                            fmt.parse(dateStr)?.time ?: file.lastModified()
-                        } else {
-                            file.lastModified()
-                        }
-                    } catch (_: Exception) {
-                        file.lastModified()
-                    }
-
-                    val entry = GameEntry(
-                        gameId = baseId,
-                        season = season,
-                        fileName = file.name,
-                        localPath = file.absolutePath,
-                        startedAt = startedAt,
-                        finishedAt = startedAt,
-                        redScore = redScore,
-                        whiteScore = whiteScore
-                    )
-
-                    gameDao.upsertGame(entry)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    // на один кривой файл не падаем, просто пропускаем
-                }
-            }
-        }
-    }
 
 
 
@@ -1176,9 +1107,6 @@ fun ScoreboardScreen(
         return file
     }
 
-
-
-
     suspend fun applyAppSettingsFromServer() {
         val dbRoot = getLocalDbRoot(context)
         val settingsDir = File(dbRoot, "settings")
@@ -1192,12 +1120,38 @@ fun ScoreboardScreen(
         try {
             val root = org.json.JSONObject(text)
 
+            // 1. Читаем ВСЕ настройки из app_settings.json
+            val seasonFromServer = root.optString("currentSeason", "").trim()
+            val urlFromServer = root.optString("serverUrl", "").trim()
+            val apiKeyFromServer = root.optString("apiKey", "").trim()
+
             val tokenFromServer = root.optString("telegramBotToken", "").trim()
             val hockeyChatFromServer = root.optString("telegramHockeyChatId", "").trim()
             val botChatFromServer = root.optString("telegramBotChatId", "").trim()
 
-            // Обновляем репозиторий и локальное состояние там, где значения не пустые
+            // 2. Репозиторий настроек
             val impl = settingsRepository as SettingsRepositoryImpl
+
+            // --- Основные игровые / сетевые настройки ---
+
+            if (seasonFromServer.isNotEmpty()) {
+                // в SharedPreferences
+                setCurrentSeason(context, seasonFromServer)
+                // в локальный state экрана
+                currentSeason = seasonFromServer
+            }
+
+            if (urlFromServer.isNotEmpty()) {
+                impl.setServerUrl(urlFromServer)
+                serverUrl = urlFromServer
+            }
+
+            if (apiKeyFromServer.isNotEmpty()) {
+                impl.setApiKey(apiKeyFromServer)
+                apiKey = apiKeyFromServer
+            }
+
+            // --- Telegram-настройки ---
 
             if (tokenFromServer.isNotEmpty()) {
                 impl.setTelegramBotToken(tokenFromServer)
@@ -1214,12 +1168,13 @@ fun ScoreboardScreen(
                 telegramBotChatId = botChatFromServer
             }
 
-            // При желании сюда же позже добавим импорт периода / перерыва / языка / темы
+            // При желании сюда позже добавим импорт периода / перерыва / языка / темы
 
         } catch (e: Exception) {
             e.printStackTrace()
         }
     }
+
 
     suspend fun applyBaseRosterFromServer() {
         val dbRoot = getLocalDbRoot(context)
@@ -1971,13 +1926,26 @@ fun ScoreboardScreen(
                                     BasicTextField(
                                         value = userIdText,
                                         onValueChange = { text ->
-                                            userIdText = text
+                                            // Разрешаем один ведущий '-' и цифры
+                                            val trimmed = text.trim()
+                                            val cleaned = buildString {
+                                                trimmed.forEachIndexed { index, c ->
+                                                    when {
+                                                        index == 0 && c == '-' -> append(c)
+                                                        c.isDigit()            -> append(c)
+                                                    }
+                                                }
+                                            }
 
-                                            val cleaned = text.trim().ifEmpty { null }
+                                            // Обновляем текст в поле
+                                            userIdText = cleaned
+
+                                            // В модель пишем либо строку, либо null, если поле пустое
+                                            val valueForModel: String? = cleaned.ifEmpty { null }
 
                                             basePlayers = basePlayers
                                                 .map { p ->
-                                                    if (p.name == player.name) p.copy(userId = cleaned) else p
+                                                    if (p.name == player.name) p.copy(userId = valueForModel) else p
                                                 }
                                                 .sortedBy { it.name }
                                         },
@@ -2175,14 +2143,15 @@ fun ScoreboardScreen(
                                     val result = syncRepository.syncDatabase()
 
                                     if (result is SyncResult.Success) {
-                                        // 1. Файлы обновлены – пересобираем индекс игр
-                                        rebuildGamesIndexFromFilesystem()
+                                        // 1. Файлы обновлены – пересобираем индекс игр по всем источникам
+                                        withContext(Dispatchers.IO) {
+                                            rebuildGamesIndexFromAllSources(context, gameDao)
+                                        }
 
                                         // 2. Импортируем настройки приложения из settings/app_settings.json
                                         applyAppSettingsFromServer()
-                                        // 3. Импортируем базовый список игроков из base_roster/base_players.json
-                                        applyBaseRosterFromServer()
                                     }
+
 
                                     val message = when (result) {
                                         is SyncResult.Success -> "Синхронизация выполнена"
