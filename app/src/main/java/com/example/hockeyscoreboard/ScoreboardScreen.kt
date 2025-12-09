@@ -1217,6 +1217,65 @@ fun ScoreboardScreen(
         }
     }
 
+    suspend fun applyBaseRosterFromServer() {
+        val dbRoot = getLocalDbRoot(context)
+        val baseRosterDir = File(dbRoot, "base_roster")
+        val baseFile = File(baseRosterDir, "base_players.json")
+
+        if (!baseFile.exists()) return
+
+        val text = withContext(Dispatchers.IO) {
+            baseFile.readText(Charsets.UTF_8)
+        }
+
+        try {
+            val root = JSONObject(text)
+            val playersArr = root.optJSONArray("players") ?: JSONArray()
+
+            val newBase = mutableListOf<PlayerInfo>()
+
+            for (i in 0 until playersArr.length()) {
+                val obj = playersArr.optJSONObject(i) ?: continue
+
+                val fullName = obj.optString("full_name").trim()
+                if (fullName.isEmpty()) continue
+
+                // role: "def" / "fwd" / "uni"
+                val roleStr = obj.optString("role", "").trim().lowercase(Locale.getDefault())
+                val role = when (roleStr) {
+                    "def" -> PlayerRole.DEFENDER
+                    "fwd" -> PlayerRole.FORWARD
+                    "uni", "univ", "universal", "" -> PlayerRole.UNIVERSAL
+                    else -> PlayerRole.UNIVERSAL
+                }
+
+                val rating = obj.optInt("rating", 0).coerceIn(0, 999)
+
+                val userIdAny = obj.opt("user_id")
+                val userIdStr = when {
+                    userIdAny == null || userIdAny == JSONObject.NULL -> null
+                    else -> userIdAny.toString().trim().ifEmpty { null }
+                }
+
+                newBase += PlayerInfo(
+                    name = fullName,
+                    role = role,
+                    rating = rating,
+                    userId = userIdStr
+                )
+            }
+
+            if (newBase.isNotEmpty()) {
+                // Обновляем состояние и SharedPreferences
+                basePlayers = newBase.sortedBy { it.name }
+                saveBasePlayers(prefs, basePlayers)
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+    }
+
+
 
 
 
@@ -2117,6 +2176,8 @@ fun ScoreboardScreen(
 
                                         // 2. Импортируем настройки приложения из settings/app_settings.json
                                         applyAppSettingsFromServer()
+                                        // 3. Импортируем базовый список игроков из base_roster/base_players.json
+                                        applyBaseRosterFromServer()
                                     }
 
                                     val message = when (result) {
@@ -2293,10 +2354,11 @@ fun ScoreboardScreen(
                                         if (existing != null) {
                                             var updated = existing
 
-                                            // Если у базового игрока ещё нет UserID, а из файла он пришёл — дописываем
-                                            if (updated.userId == null && item.userId != null) {
+                                            // СТАЛО: обновляем, если с сервера пришёл userId и он отличается от локального
+                                            if (item.userId != null && item.userId != updated.userId) {
                                                 updated = updated.copy(userId = item.userId)
                                             }
+
 
                                             // TODO: при желании можно в будущем обновлять role/line
 
