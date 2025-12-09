@@ -183,8 +183,10 @@ fun loadActiveGameSnapshotOrNull(context: Context): ActiveGameSnapshot? {
                 assist1 = assist1,
                 assist2 = assist2,
                 eventOrder = order,
-                timestampMillis = 1L
+                // 0L = "время гола неизвестно" (из active_game.json старого формата)
+                timestampMillis = 0L
             )
+
         }
 
 
@@ -931,7 +933,7 @@ fun ScoreboardScreen(
                 playersArray.put(obj)
             }
 
-        // --- goals[] ---
+// --- goals[] ---
         val goalsArray = org.json.JSONArray()
         val start = gameStartMillis ?: System.currentTimeMillis()
 
@@ -944,16 +946,18 @@ fun ScoreboardScreen(
             obj.put("assist1_id", goal.assist1 ?: org.json.JSONObject.NULL)
             obj.put("assist2_id", goal.assist2 ?: org.json.JSONObject.NULL)
 
-            // minute = разница между временем гола и временем старта
-            val minute = if (goal.timestampMillis != null) {
-                ((goal.timestampMillis!! - start) / 60000L).coerceAtLeast(0)
-            } else {
-                0L
-            }
+            // minute = разница между временем гола и стартом, либо 0, если время гола неизвестно
+            val minute: Long =
+                if (goal.timestampMillis > 0L) {
+                    ((goal.timestampMillis - start) / 60000L).coerceAtLeast(0)
+                } else {
+                    0L
+                }
             obj.put("minute", minute)
 
             goalsArray.put(obj)
         }
+
 
         // --- итоговый JSON ---
         // --- итоговый JSON ---
@@ -1063,10 +1067,10 @@ fun ScoreboardScreen(
             val assist2Id = assist2Raw?.toLongOrNull() ?: if (g.assist2 == null) null else 0L
 
             val minuteJson: Any =
-                if (g.timestampMillis != null && g.timestampMillis != 1L) {
+                if (g.timestampMillis > 0L) {
                     ((g.timestampMillis - start) / 60000L).coerceAtLeast(0)
                 } else {
-                    org.json.JSONObject.NULL
+                    org.json.JSONObject.NULL   // для внешнего API: "нет данных"
                 }
 
             val o = org.json.JSONObject()
@@ -3061,8 +3065,13 @@ fun ScoreboardScreen(
 
     // --- ДИАЛОГ: СПИСОК ЗАВЕРШЁННЫХ ИГР ---
 
+    // --- ДИАЛОГ: СПИСОК ЗАВЕРШЁННЫХ ИГР ---
+
     if (showHistoryDialog) {
-        val  savedGames = gameDao.getAllGames()
+        // при каждом изменении historyRefreshKey список игр перечитывается
+        val savedGames by remember(historyRefreshKey) {
+            mutableStateOf(gameDao.getAllGames())
+        }
 
         AlertDialog(
             onDismissRequest = {
@@ -3151,6 +3160,7 @@ fun ScoreboardScreen(
             textContentColor = DialogTextColor
         )
     }
+
 
     // --- ДИАЛОГ: ПРОТОКОЛ МАТЧА (+ УДАЛЕНИЕ / ЭКСПОРТ) ---
 
