@@ -9,6 +9,7 @@ import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
@@ -62,6 +63,7 @@ import androidx.compose.runtime.mutableStateMapOf
 import org.json.JSONObject
 import org.json.JSONArray
 import com.example.hockeyscoreboard.data.rebuildGamesIndexFromAllSources
+import androidx.compose.material.icons.filled.Send
 
 
 
@@ -389,6 +391,10 @@ fun ScoreboardScreen(
     var showActionsMenu by remember { mutableStateOf(false) }
     var showNoTeamsDialog by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
+    var showManualExportSendDialog by remember { mutableStateOf(false) }
+    var manualSendChatId by remember { mutableStateOf("") }
+    var manualSendEventId by remember { mutableStateOf("") }
+
     // Ключ, который будем увеличивать после удаления игры,
     // чтобы диалог "Завершённые игры" перечитал список из Room
     var historyRefreshKey by remember { mutableStateOf(0L) }
@@ -798,6 +804,20 @@ fun ScoreboardScreen(
         }
     }
 
+    // Отменить изменения настроек: откатить значения и закрыть окно
+    fun discardSettingsChanges() {
+        currentSeason = initialSeason
+        serverUrl = initialServerUrl
+        apiKey = initialApiKey
+        telegramBotToken = initialTelegramBotToken
+        telegramChatId = initialTelegramChatId
+        telegramBotChatId = initialTelegramBotChatId
+
+        showSettingsConfirmDialog = false
+        showSettingsDialog = false
+    }
+
+
 
     fun saveExternalEventJson(gameId: String) {
         // База hockey-json
@@ -908,7 +928,7 @@ fun ScoreboardScreen(
         outFile.writeText(root.toString(2), Charsets.UTF_8)
     }
 
-    fun saveExternalEventJsonForServer(gameId: String) {
+    fun saveExternalEventJsonForServer(gameId: String): Int {
         // База hockey-json
         val baseDir = context.getExternalFilesDir(null) ?: context.filesDir
         val dbRoot = File(baseDir, "hockey-json")
@@ -1041,6 +1061,7 @@ fun ScoreboardScreen(
         // Имя файла
         val outFile = File(exportDir, "result_${eventIdInt}.json")
         outFile.writeText(root.toString(2), Charsets.UTF_8)
+        return eventIdInt
     }
 
 
@@ -1134,22 +1155,10 @@ fun ScoreboardScreen(
 
             // --- Основные игровые / сетевые настройки ---
 
-            if (seasonFromServer.isNotEmpty()) {
-                // в SharedPreferences
-                setCurrentSeason(context, seasonFromServer)
-                // в локальный state экрана
-                currentSeason = seasonFromServer
-            }
+// --- Основные игровые / сетевые настройки ---
+// ВАЖНО: при syncDatabase НЕ импортируем currentSeason/serverUrl/apiKey,
+// чтобы при смене сервера не перетирались локальные настройки.
 
-            if (urlFromServer.isNotEmpty()) {
-                impl.setServerUrl(urlFromServer)
-                serverUrl = urlFromServer
-            }
-
-            if (apiKeyFromServer.isNotEmpty()) {
-                impl.setApiKey(apiKeyFromServer)
-                apiKey = apiKeyFromServer
-            }
 
             // --- Telegram-настройки ---
 
@@ -1418,14 +1427,26 @@ fun ScoreboardScreen(
             )
             gameDao.upsertGame(entry)
 
-            // 3. JSON для внешней системы (наш внутренний формат)
+// 3. JSON для внешней системы (наш внутренний формат)
             saveExternalEventJson(gameId)
 
-            // 3b. JSON для внешнего API (формат event_id + user_id)
-            saveExternalEventJsonForServer(gameId)
+// 3b. JSON для внешнего API (формат event_id + user_id)
+            val eventId = saveExternalEventJsonForServer(gameId)
 
-            // 3c. Автоматическая отправка файла external-events в Telegram (если настроено)
-            sendExternalEventToTelegramIfConfigured(gameId)
+// 3c. Кладём в outbox и запускаем ретраи (Worker отправит при появлении сети)
+            val outboxRepo = ExportOutboxRepository(context)
+            outboxRepo.upsertPending(
+                gameId = gameId,
+                season = seasonLocal,
+                eventId = eventId,
+                exportFileName = "result_${eventId}.json"
+            )
+
+            ExportRetryScheduler.schedule(context)
+
+// (опционально) Прямую отправку здесь лучше убрать, чтобы не было дублей отправки.
+// sendExternalEventToTelegramIfConfigured(gameId)
+
 
 
             // 4. Уведомляем о сохранённой игре (MainActivity шлёт finished-файл на RasPi)
@@ -1734,7 +1755,7 @@ fun ScoreboardScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
-                        // Сохраняем и выгружаем
+                        showSettingsConfirmDialog = false
                         performSettingsSaveAndUpload()
                     },
                     colors = dialogButtonColors()
@@ -1742,6 +1763,9 @@ fun ScoreboardScreen(
                     Text("Да", fontSize = 16.sp)
                 }
             },
+
+
+
             dismissButton = {
                 TextButton(
                     onClick = {
@@ -2019,19 +2043,22 @@ fun ScoreboardScreen(
 
     if (showSettingsDialog) {
         AlertDialog(
-            onDismissRequest = { showSettingsDialog = false },
+            // Свайп/назад = ОТМЕНА (откатить и закрыть)
+            onDismissRequest = { discardSettingsChanges() },
+
             title = { Text("Настройки", fontSize = 20.sp) },
+
             text = {
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .verticalScroll(rememberScrollState())
                 ) {
+
+                    // --- Поля (как в ScoreboardScreenOld) ---
                     OutlinedTextField(
                         value = currentSeason,
-                        onValueChange = { value ->
-                            currentSeason = value.trim()
-                        },
+                        onValueChange = { value -> currentSeason = value.trim() },
                         label = { Text("Текущий сезон") },
                         singleLine = true,
                         modifier = Modifier
@@ -2096,7 +2123,8 @@ fun ScoreboardScreen(
                             unfocusedBorderColor = Color(0xFF455A64)
                         )
                     )
-                    // НОВОЕ поле: чат для бота (Chat)
+
+                    // External Telegram Bot ID
                     OutlinedTextField(
                         value = telegramBotChatId,
                         onValueChange = { telegramBotChatId = it },
@@ -2114,6 +2142,7 @@ fun ScoreboardScreen(
                         )
                     )
 
+                    // Hockey Chat ID
                     OutlinedTextField(
                         value = telegramChatId,
                         onValueChange = { telegramChatId = it },
@@ -2131,7 +2160,7 @@ fun ScoreboardScreen(
                         )
                     )
 
-
+                    // --- Кнопки под полями (как в ScoreboardScreenOld) ---
                     TextButton(
                         onClick = {
                             // Если уже идёт синхронизация — игнорируем повторный клик
@@ -2143,24 +2172,22 @@ fun ScoreboardScreen(
                                     val result = syncRepository.syncDatabase()
 
                                     if (result is SyncResult.Success) {
-                                        // 1. Файлы обновлены – пересобираем индекс игр по всем источникам
+                                        // 1) Файлы обновлены – пересобираем индекс игр по всем источникам
                                         withContext(Dispatchers.IO) {
                                             rebuildGamesIndexFromAllSources(context, gameDao)
                                         }
 
-                                        // 2. Импортируем настройки приложения из settings/app_settings.json
+                                        // 2) Импортируем настройки приложения из settings/app_settings.json
                                         applyAppSettingsFromServer()
                                     }
 
-
                                     val message = when (result) {
                                         is SyncResult.Success -> "Синхронизация выполнена"
-                                        is SyncResult.Error   -> "Ошибка синхронизации: ${result.message}"
+                                        is SyncResult.Error -> "Ошибка синхронизации: ${result.message}"
                                     }
 
                                     Toast.makeText(context, message, Toast.LENGTH_LONG).show()
                                 } finally {
-                                    // В ЛЮБОМ случае отпускаем кнопку
                                     isSyncing = false
                                 }
                             }
@@ -2173,9 +2200,6 @@ fun ScoreboardScreen(
                             fontSize = 16.sp
                         )
                     }
-
-
-
 
                     TextButton(
                         onClick = {
@@ -2191,10 +2215,11 @@ fun ScoreboardScreen(
                     }
                 }
             },
+
+            // ОКЕЙ: если были изменения -> открыть confirm-dialog, иначе просто закрыть
             confirmButton = {
                 TextButton(
                     onClick = {
-                        // Проверяем, есть ли реальные изменения
                         val changed =
                             currentSeason != initialSeason ||
                                     serverUrl != initialServerUrl ||
@@ -2204,28 +2229,35 @@ fun ScoreboardScreen(
                                     telegramBotChatId != initialTelegramBotChatId
 
                         if (changed) {
-                            // Показываем диалог подтверждения изменений
                             showSettingsConfirmDialog = true
                         } else {
-                            // Ничего не менялось — просто закрываем настройки без выгрузки и тоста
                             showSettingsDialog = false
                         }
                     },
                     colors = dialogButtonColors()
                 ) {
-                    Text("Закрыть", fontSize = 16.sp)
+                    Text("Окей", fontSize = 16.sp)
                 }
             },
 
-
-
-
+            // ОТМЕНА: откатить изменения + закрыть
+            dismissButton = {
+                TextButton(
+                    onClick = { discardSettingsChanges() },
+                    colors = dialogButtonColors()
+                ) {
+                    Text("Отмена", fontSize = 16.sp)
+                }
+            },
 
             containerColor = DialogBackground,
             titleContentColor = DialogTitleColor,
             textContentColor = DialogTextColor
         )
     }
+
+
+
 
     // --- ДИАЛОГ: СОСТАВЫ КОМАНД ---
 
@@ -3141,8 +3173,11 @@ fun ScoreboardScreen(
                 historySelectedEntry = null
                 historySelectedFile = null
             },
-            title = { Text("Протокол матча", fontSize = 20.sp) },
             text = {
+                // Берём статус outbox для выбранной игры (если есть)
+                val entry = historySelectedEntry
+                val outboxItem = entry?.let { ExportOutboxRepository(context).getByGameId(it.gameId) }
+
                 Column(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -3154,8 +3189,32 @@ fun ScoreboardScreen(
                         fontSize = 14.sp,
                         color = DialogTextColor
                     )
+
+                    Spacer(Modifier.height(12.dp))
+
+                    Text(
+                        text = when (outboxItem?.status) {
+                            ExportOutboxStatus.SENT -> "Экспорт: отправлено"
+                            ExportOutboxStatus.FAILED -> "Экспорт: ошибка (попыток: ${outboxItem.attempts})"
+                            ExportOutboxStatus.PENDING -> "Экспорт: ожидает отправки"
+                            null -> "Экспорт: нет данных"
+                        },
+                        fontSize = 14.sp,
+                        color = DialogTextColor
+                    )
+
+                    // Если хочешь чуть информативнее — можно включить lastError для FAILED.
+                    if (outboxItem?.status == ExportOutboxStatus.FAILED && !outboxItem.lastError.isNullOrBlank()) {
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = "Причина: ${outboxItem.lastError}",
+                            fontSize = 12.sp,
+                            color = DialogTextColor
+                        )
+                    }
                 }
             },
+
             confirmButton = {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -3189,6 +3248,22 @@ fun ScoreboardScreen(
 
                     IconButton(
                         onClick = {
+                            val settings = SettingsRepositoryImpl(context)
+                            manualSendChatId = settings.getTelegramBotChatId()
+                            manualSendEventId = "" // пусто = взять из archived JSON
+                            showManualExportSendDialog = true
+                        }
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Send,
+                            contentDescription = "Отправить в Telegram",
+                            tint = DialogTitleColor
+                        )
+                    }
+
+
+                    IconButton(
+                        onClick = {
                             showHistoryDetailsDialog = false
                             historyDetailsText = ""
                             historySelectedEntry = null
@@ -3208,6 +3283,105 @@ fun ScoreboardScreen(
             textContentColor = DialogTextColor
         )
     }
+
+
+    if (showManualExportSendDialog) {
+        AlertDialog(
+            onDismissRequest = { showManualExportSendDialog = false },
+            title = { Text("Отправить экспорт", fontSize = 20.sp) },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth()) {
+
+                    Text("Получатель (Telegram chat_id):", color = DialogTextColor)
+                    TextField(
+                        value = manualSendChatId,
+                        onValueChange = { manualSendChatId = it },
+                        singleLine = true
+                    )
+
+                    Spacer(Modifier.height(12.dp))
+
+                    Text("Event ID (оставь пустым — возьмём из протокола):", color = DialogTextColor)
+                    TextField(
+                        value = manualSendEventId,
+                        onValueChange = { manualSendEventId = it.filter { ch -> ch.isDigit() } },
+                        singleLine = true
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val entry = historySelectedEntry
+                        val file = historySelectedFile
+
+                        if (entry == null || file == null) {
+                            Toast.makeText(context, "Не выбрана игра", Toast.LENGTH_LONG).show()
+                            return@TextButton
+                        }
+
+                        val settings = SettingsRepositoryImpl(context)
+                        val token = settings.getTelegramBotToken().trim()
+                        val chatId = manualSendChatId.trim()
+
+                        if (token.isBlank() || chatId.isBlank()) {
+                            Toast.makeText(context, "Не задан Telegram Token или chat_id", Toast.LENGTH_LONG).show()
+                            return@TextButton
+                        }
+
+                        val overrideEventId = manualSendEventId.trim().toIntOrNull()
+
+                        // 1) Генерим/перегенерим экспорт из архивного finished JSON
+                        val generated = ArchivedExportGenerator.generate(
+                            context = context,
+                            finishedGameFile = file,
+                            basePlayers = basePlayers,
+                            eventIdOverride = overrideEventId
+                        )
+
+                        // 2) Обновляем outbox (последний победил)
+                        val outboxRepo = ExportOutboxRepository(context)
+                        outboxRepo.upsertPending(
+                            gameId = entry.gameId,
+                            season = entry.season,
+                            eventId = generated.eventId,
+                            exportFileName = generated.exportFile.name
+                        )
+
+                        // 3) Ручная отправка с подтверждением
+                        val res = TelegramDocumentSender.sendDocument(
+                            token = token,
+                            chatId = chatId,
+                            file = generated.exportFile,
+                            contentType = "application/json"
+                        )
+
+                        if (res.isSuccess) {
+                            outboxRepo.markSent(entry.gameId)
+                            Toast.makeText(context, "Отправлено", Toast.LENGTH_LONG).show()
+                        } else {
+                            val err = res.exceptionOrNull()?.message ?: "Ошибка отправки"
+                            outboxRepo.markFailed(entry.gameId, err)
+                            Toast.makeText(context, "Не отправлено: $err", Toast.LENGTH_LONG).show()
+                            ExportRetryScheduler.schedule(context)
+
+                            // (опционально) ставим ретрай-воркер, если хочешь:
+                            // ExportRetryScheduler.schedule(context)
+                        }
+
+                        showManualExportSendDialog = false
+                    }
+                ) { Text("Отправить") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showManualExportSendDialog = false }) { Text("Отмена") }
+            },
+            containerColor = DialogBackground,
+            titleContentColor = DialogTitleColor,
+            textContentColor = DialogTextColor
+        )
+    }
+
 
     // --- ДИАЛОГ: ПОДТВЕРЖДЕНИЕ УДАЛЕНИЯ ИГРЫ ---
 
