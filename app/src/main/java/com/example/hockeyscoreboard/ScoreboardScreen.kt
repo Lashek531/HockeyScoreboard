@@ -50,11 +50,13 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.ui.platform.LocalContext
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+
 
 import com.example.hockeyscoreboard.data.SettingsRepositoryImpl
 import com.example.hockeyscoreboard.data.SyncRepository
 import com.example.hockeyscoreboard.data.SyncResult
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.DataOutputStream
 import java.net.HttpURLConnection
@@ -394,6 +396,10 @@ fun ScoreboardScreen(
     var showManualExportSendDialog by remember { mutableStateOf(false) }
     var manualSendChatId by remember { mutableStateOf("") }
     var manualSendEventId by remember { mutableStateOf("") }
+    var manualExportSending by remember { mutableStateOf(false) }
+
+
+
 
     // Ключ, который будем увеличивать после удаления игры,
     // чтобы диалог "Завершённые игры" перечитал список из Room
@@ -3311,67 +3317,98 @@ fun ScoreboardScreen(
             },
             confirmButton = {
                 TextButton(
+                    enabled = !manualExportSending,
                     onClick = {
+                        if (manualExportSending) return@TextButton
+
                         val entry = historySelectedEntry
                         val file = historySelectedFile
 
                         if (entry == null || file == null) {
-                            Toast.makeText(context, "Не выбрана игра", Toast.LENGTH_LONG).show()
+                            Toast.makeText(context, "Не выбрана игра для экспорта", Toast.LENGTH_LONG).show()
                             return@TextButton
                         }
 
-                        val settings = SettingsRepositoryImpl(context)
-                        val token = settings.getTelegramBotToken().trim()
                         val chatId = manualSendChatId.trim()
-
-                        if (token.isBlank() || chatId.isBlank()) {
-                            Toast.makeText(context, "Не задан Telegram Token или chat_id", Toast.LENGTH_LONG).show()
+                        if (chatId.isBlank()) {
+                            Toast.makeText(context, "Не задан Telegram chat_id", Toast.LENGTH_LONG).show()
                             return@TextButton
                         }
 
-                        val overrideEventId = manualSendEventId.trim().toIntOrNull()
+                        manualExportSending = true
 
-                        // 1) Генерим/перегенерим экспорт из архивного finished JSON
-                        val generated = ArchivedExportGenerator.generate(
-                            context = context,
-                            finishedGameFile = file,
-                            basePlayers = basePlayers,
-                            eventIdOverride = overrideEventId
-                        )
+                        scope.launch {
+                            val outcome = withContext(Dispatchers.IO) {
+                                val outboxRepo = ExportOutboxRepository(context)
 
-                        // 2) Обновляем outbox (последний победил)
-                        val outboxRepo = ExportOutboxRepository(context)
-                        outboxRepo.upsertPending(
-                            gameId = entry.gameId,
-                            season = entry.season,
-                            eventId = generated.eventId,
-                            exportFileName = generated.exportFile.name
-                        )
+                                runCatching {
+                                    val settings = SettingsRepositoryImpl(context)
+                                    val token = settings.getTelegramBotToken().trim()
 
-                        // 3) Ручная отправка с подтверждением
-                        val res = TelegramDocumentSender.sendDocument(
-                            token = token,
-                            chatId = chatId,
-                            file = generated.exportFile,
-                            contentType = "application/json"
-                        )
+                                    require(token.isNotBlank()) { "Не задан Telegram Token" }
 
-                        if (res.isSuccess) {
-                            outboxRepo.markSent(entry.gameId)
-                            Toast.makeText(context, "Отправлено", Toast.LENGTH_LONG).show()
-                        } else {
-                            val err = res.exceptionOrNull()?.message ?: "Ошибка отправки"
-                            outboxRepo.markFailed(entry.gameId, err)
-                            Toast.makeText(context, "Не отправлено: $err", Toast.LENGTH_LONG).show()
-                            ExportRetryScheduler.schedule(context)
+                                    val overrideEventId = manualSendEventId.trim().toIntOrNull()
 
-                            // (опционально) ставим ретрай-воркер, если хочешь:
-                            // ExportRetryScheduler.schedule(context)
+                                    // 1) Генерим/перегенерим экспорт из архивного finished JSON
+                                    val generated = ArchivedExportGenerator.generate(
+                                        context = context,
+                                        finishedGameFile = file,
+                                        basePlayers = basePlayers,
+                                        eventIdOverride = overrideEventId
+                                    )
+
+                                    // 2) Обновляем outbox (последний победил)
+                                    outboxRepo.upsertPending(
+                                        gameId = entry.gameId,
+                                        season = entry.season,
+                                        eventId = generated.eventId,
+                                        exportFileName = generated.exportFile.name
+                                    )
+
+                                    // 3) Отправляем документ в Telegram
+                                    val res = TelegramDocumentSender.sendDocument(
+                                        token = token,
+                                        chatId = chatId,
+                                        file = generated.exportFile,
+                                        contentType = "application/json"
+                                    )
+
+                                    if (res.isSuccess) {
+                                        outboxRepo.markSent(entry.gameId)
+                                        Triple(true, null, false)
+                                    } else {
+                                        val err = res.exceptionOrNull()?.message ?: "Ошибка отправки"
+                                        outboxRepo.markFailed(entry.gameId, err)
+                                        Triple(false, err, true)
+                                    }
+                                }.getOrElse { e ->
+                                    val err = e.message ?: "Ошибка отправки"
+                                    outboxRepo.markFailed(entry.gameId, err)
+                                    Triple(false, err, true)
+                                }
+                            }
+
+                            manualExportSending = false
+
+                            val success = outcome.first
+                            val err = outcome.second
+                            val needRetry = outcome.third
+
+                            if (success) {
+                                Toast.makeText(context, "Отправлено", Toast.LENGTH_LONG).show()
+                            } else {
+                                Toast.makeText(context, "Не отправлено: ${err ?: "Ошибка отправки"}", Toast.LENGTH_LONG).show()
+                                if (needRetry) {
+                                    ExportRetryScheduler.schedule(context)
+                                }
+                            }
+
+                            showManualExportSendDialog = false
                         }
-
-                        showManualExportSendDialog = false
                     }
                 ) { Text("Отправить") }
+
+
             },
             dismissButton = {
                 TextButton(onClick = { showManualExportSendDialog = false }) { Text("Отмена") }
