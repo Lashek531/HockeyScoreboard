@@ -446,6 +446,7 @@ fun ScoreboardScreen(
             // если не дали — статус останется “не найдена/поиск…”, это ок для MVP
         }
     )
+
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
         onResult = { granted ->
@@ -1861,14 +1862,101 @@ fun ScoreboardScreen(
 
         AlertDialog(
             onDismissRequest = { showTabloRemoteDialog = false },
-            title = { Text("ESP32 табло") },
-            text = { Text(espStatus) },
+            title = { Text("Пульт табло — Быстрые клавиши") },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+
+                    Text(espStatus)
+
+                    // --- СЧЁТ (крупные кнопки) ---
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Счёт")
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { scope.launch { espController.press("1") } },
+                                modifier = Modifier.weight(1f).height(56.dp)
+                            ) { Text("Левый +") }
+
+                            Button(
+                                onClick = { scope.launch { espController.press("4") } },
+                                modifier = Modifier.weight(1f).height(56.dp)
+                            ) { Text("Левый −") }
+                        }
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { scope.launch { espController.press("3") } },
+                                modifier = Modifier.weight(1f).height(56.dp)
+                            ) { Text("Правый +") }
+
+                            Button(
+                                onClick = { scope.launch { espController.press("6") } },
+                                modifier = Modifier.weight(1f).height(56.dp)
+                            ) { Text("Правый −") }
+                        }
+                    }
+
+                    // --- ТАЙМ / ПЕРИОД (меньше) + переключение индикации ---
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Тайм и режим")
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = { scope.launch { espController.press("2") } },
+                                modifier = Modifier.weight(1f).height(44.dp)
+                            ) { Text("Тайм +", maxLines = 1) }
+
+                            OutlinedButton(
+                                onClick = { scope.launch { espController.press("5") } },
+                                modifier = Modifier.weight(1f).height(44.dp)
+                            ) { Text("Тайм −", maxLines = 1) }
+
+                            OutlinedButton(
+                                onClick = { scope.launch { espController.press("ПрВРМ") } },
+                                modifier = Modifier.weight(1f).height(44.dp)
+                            ) { Text("Часы/Таймер", maxLines = 1) }
+                        }
+                    }
+
+                    // --- УПРАВЛЕНИЕ ВРЕМЕНЕМ (внизу) ---
+                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text("Время")
+
+                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            OutlinedButton(
+                                onClick = { scope.launch { espController.press("-") } },
+                                modifier = Modifier.weight(1f).height(44.dp)
+                            ) { Text("Старт", maxLines = 1) }
+
+                            OutlinedButton(
+                                onClick = { scope.launch { espController.press("9") } },
+                                modifier = Modifier.weight(1f).height(44.dp)
+                            ) { Text("Пауза", maxLines = 1) }
+
+                            OutlinedButton(
+                                onClick = { scope.launch { espController.sendPresses("8", 3) } },
+                                modifier = Modifier.weight(1f).height(44.dp)
+                            ) { Text("Сброс", maxLines = 1) }
+                        }
+                    }
+
+                    // --- ВЫХОД (×3) ---
+                    OutlinedButton(
+                        onClick = { scope.launch { espController.sendPresses("выход", 3) } },
+                        modifier = Modifier.fillMaxWidth().height(44.dp)
+                    ) {
+                        Text("Выход (×3)")
+                    }
+                }
+            },
             confirmButton = {
                 TextButton(onClick = { showTabloRemoteDialog = false }) {
                     Text("Закрыть")
                 }
             }
         )
+
     }
 
 
