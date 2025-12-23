@@ -92,6 +92,11 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.core.content.ContextCompat
 import com.example.hockeyscoreboard.esp.EspTabloController
 import android.os.Build
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Remove
+import androidx.compose.material3.Icon
+
+
 
 
 
@@ -1862,94 +1867,308 @@ fun ScoreboardScreen(
 
         AlertDialog(
             onDismissRequest = { showTabloRemoteDialog = false },
-            title = { Text("Пульт табло — Быстрые клавиши") },
-            text = {
-                Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-
-                    Text(espStatus)
-
-                    // --- СЧЁТ (крупные кнопки) ---
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("Счёт")
-
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(
-                                onClick = { scope.launch { espController.press("1") } },
-                                modifier = Modifier.weight(1f).height(56.dp)
-                            ) { Text("Левый +") }
-
-                            Button(
-                                onClick = { scope.launch { espController.press("4") } },
-                                modifier = Modifier.weight(1f).height(56.dp)
-                            ) { Text("Левый −") }
-                        }
-
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            Button(
-                                onClick = { scope.launch { espController.press("3") } },
-                                modifier = Modifier.weight(1f).height(56.dp)
-                            ) { Text("Правый +") }
-
-                            Button(
-                                onClick = { scope.launch { espController.press("6") } },
-                                modifier = Modifier.weight(1f).height(56.dp)
-                            ) { Text("Правый −") }
-                        }
-                    }
-
-                    // --- ТАЙМ / ПЕРИОД (меньше) + переключение индикации ---
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("Тайм и режим")
-
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(
-                                onClick = { scope.launch { espController.press("2") } },
-                                modifier = Modifier.weight(1f).height(44.dp)
-                            ) { Text("Тайм +", maxLines = 1) }
-
-                            OutlinedButton(
-                                onClick = { scope.launch { espController.press("5") } },
-                                modifier = Modifier.weight(1f).height(44.dp)
-                            ) { Text("Тайм −", maxLines = 1) }
-
-                            OutlinedButton(
-                                onClick = { scope.launch { espController.press("ПрВРМ") } },
-                                modifier = Modifier.weight(1f).height(44.dp)
-                            ) { Text("Часы/Таймер", maxLines = 1) }
-                        }
-                    }
-
-                    // --- УПРАВЛЕНИЕ ВРЕМЕНЕМ (внизу) ---
-                    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Text("Время")
-
-                        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            OutlinedButton(
-                                onClick = { scope.launch { espController.press("-") } },
-                                modifier = Modifier.weight(1f).height(44.dp)
-                            ) { Text("Старт", maxLines = 1) }
-
-                            OutlinedButton(
-                                onClick = { scope.launch { espController.press("9") } },
-                                modifier = Modifier.weight(1f).height(44.dp)
-                            ) { Text("Пауза", maxLines = 1) }
-
-                            OutlinedButton(
-                                onClick = { scope.launch { espController.sendPresses("8", 3) } },
-                                modifier = Modifier.weight(1f).height(44.dp)
-                            ) { Text("Сброс", maxLines = 1) }
-                        }
-                    }
-
-                    // --- ВЫХОД (×3) ---
-                    OutlinedButton(
-                        onClick = { scope.launch { espController.sendPresses("выход", 3) } },
-                        modifier = Modifier.fillMaxWidth().height(44.dp)
-                    ) {
-                        Text("Выход (×3)")
-                    }
+            title = {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.Center
+                ) {
+                    Text("Табло")
                 }
             },
+
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 640.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    TabRow(
+                        selectedTabIndex = remoteTabIndex,
+                        containerColor = Color.Transparent,
+                        divider = {}
+                    ) {
+                        Tab(
+                            selected = remoteTabIndex == 0,
+                            onClick = { remoteTabIndex = 0 },
+                            text = {
+                                Text(
+                                    "Табло",
+                                    fontWeight = if (remoteTabIndex == 0) FontWeight.SemiBold else FontWeight.Normal,
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                            }
+                        )
+
+                        Tab(
+                            selected = remoteTabIndex == 1,
+                            onClick = { remoteTabIndex = 1 },
+                            text = {
+                                Text(
+                                    "Настройки",
+                                    fontWeight = if (remoteTabIndex == 1) FontWeight.SemiBold else FontWeight.Normal,
+                                    style = MaterialTheme.typography.titleMedium
+                                )
+                            }
+                        )
+
+                    }
+
+
+                    when (remoteTabIndex) {
+                        0 -> {
+                            // ===================== ВКЛАДКА: ТАБЛО =====================
+
+                            // --- СЧЁТ ---
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("Счёт")
+
+                                // 2×2: слева (левый счёт), справа (правый счёт)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    // Левая колонка: + сверху, − снизу
+                                    Column(
+                                        modifier = Modifier.weight(1f),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Button(
+                                            onClick = { scope.launch { espController.press("1") } },
+                                            modifier = Modifier.fillMaxWidth().height(56.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Add,
+                                                contentDescription = "+",
+                                                modifier = Modifier.size(28.dp)
+                                            )
+                                        }
+
+                                        Button(
+                                            onClick = { scope.launch { espController.press("4") } },
+                                            modifier = Modifier.fillMaxWidth().height(56.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Remove,
+                                                contentDescription = "−",
+                                                modifier = Modifier.size(28.dp)
+                                            )
+                                        }
+                                    }
+
+                                    // Правая колонка: + сверху, − снизу
+                                    Column(
+                                        modifier = Modifier.weight(1f),
+                                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        Button(
+                                            onClick = { scope.launch { espController.press("3") } },
+                                            modifier = Modifier.fillMaxWidth().height(56.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Add,
+                                                contentDescription = "+",
+                                                modifier = Modifier.size(28.dp)
+                                            )
+                                        }
+
+                                        Button(
+                                            onClick = { scope.launch { espController.press("6") } },
+                                            modifier = Modifier.fillMaxWidth().height(56.dp)
+                                        ) {
+                                            Icon(
+                                                imageVector = Icons.Filled.Remove,
+                                                contentDescription = "−",
+                                                modifier = Modifier.size(28.dp)
+                                            )
+                                        }
+                                    }
+                                }
+                            }
+
+                            // --- ВРЕМЯ (важнее, сразу после счёта) ---
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("Время")
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.press("-") } },
+                                        modifier = Modifier.weight(1f).height(44.dp)
+                                    ) { Text("Старт", maxLines = 1) }
+
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.press("9") } },
+                                        modifier = Modifier.weight(1f).height(44.dp)
+                                    ) { Text("Пауза", maxLines = 1) }
+
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.sendPresses("8", 3) } },
+                                        modifier = Modifier.weight(1f).height(44.dp)
+                                    ) { Text("Сброс", maxLines = 1) }
+                                }
+                            }
+
+                            // --- ТАЙМ И РЕЖИМ (ниже) ---
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                Text("Тайм и режим")
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                ) {
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.press("2") } },
+                                        modifier = Modifier.weight(1f).height(44.dp)
+                                    ) { Text("Тайм +", maxLines = 1) }
+
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.press("5") } },
+                                        modifier = Modifier.weight(1f).height(44.dp)
+                                    ) { Text("Тайм −", maxLines = 1) }
+
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.press("ПрВРМ") } },
+                                        modifier = Modifier.weight(1f).height(44.dp)
+                                    ) { Text("Часы/Таймер", maxLines = 1) }
+                                }
+                            }
+
+                            // --- РЕЖИМ = выход ×3 ---
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.Center
+                            ) {
+                                OutlinedButton(
+                                    onClick = { scope.launch { espController.sendPresses("выход", 3) } },
+                                    modifier = Modifier.widthIn(min = 180.dp).height(40.dp)
+                                ) {
+                                    Text("Режим")
+                                }
+                            }
+                        }
+
+
+                        1 -> {
+                            // ===================== ВКЛАДКА: НАСТРОЙКИ =====================
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(16.dp)
+                            ) {
+                                // ---------- Левая колонка: технические кнопки ----------
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                                ) {
+                                    // Режим = выход ×3 (циклическое переключение)
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.sendPresses("выход", 3) } },
+                                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                                    ) {
+                                        Text("Режим", style = MaterialTheme.typography.titleMedium)
+                                    }
+
+                                    // Яркость (+/-)
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.press("+ярк") } },
+                                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                                    ) {
+                                        Text("+ярк", style = MaterialTheme.typography.titleMedium)
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.press("-ярк") } },
+                                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                                    ) {
+                                        Text("-ярк", style = MaterialTheme.typography.titleMedium)
+                                    }
+
+                                    // Время / секундомер / таймер (без заголовков)
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.press("ВРЕМЯ") } },
+                                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                                    ) {
+                                        Text("ВРЕМЯ", style = MaterialTheme.typography.titleMedium)
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.press("СЕК") } },
+                                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                                    ) {
+                                        Text("СЕК", style = MaterialTheme.typography.titleMedium)
+                                    }
+
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.press("ТАЙМЕР") } },
+                                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                                    ) {
+                                        Text("ТАЙМЕР", style = MaterialTheme.typography.titleMedium)
+                                    }
+                                }
+
+                                // ---------- Правая колонка: numpad (крупнее) ----------
+                                Column(
+                                    modifier = Modifier.weight(1.4f),
+                                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                                ) {
+                                    fun numBtn(label: String) = @Composable {
+                                        OutlinedButton(
+                                            onClick = { scope.launch { espController.press(label) } },
+                                            modifier = Modifier.weight(1f).height(60.dp)
+                                        ) {
+                                            Text(label, style = MaterialTheme.typography.titleLarge)
+                                        }
+                                    }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) { numBtn("7")(); numBtn("8")(); numBtn("9")() }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) { numBtn("4")(); numBtn("5")(); numBtn("6")() }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) { numBtn("1")(); numBtn("2")(); numBtn("3")() }
+
+                                    Row(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                                    ) {
+                                        Spacer(Modifier.weight(1f))
+                                        OutlinedButton(
+                                            onClick = { scope.launch { espController.press("0") } },
+                                            modifier = Modifier.weight(1f).height(60.dp)
+                                        ) {
+                                            Text("0", style = MaterialTheme.typography.titleLarge)
+                                        }
+                                        Spacer(Modifier.weight(1f))
+                                    }
+                                }
+                            }
+                        }
+
+
+                    }
+
+                    // Статус ESP — внизу, общий для обеих вкладок
+                    Text(
+                        text = espStatus,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            },
+
+
             confirmButton = {
                 TextButton(onClick = { showTabloRemoteDialog = false }) {
                     Text("Закрыть")
