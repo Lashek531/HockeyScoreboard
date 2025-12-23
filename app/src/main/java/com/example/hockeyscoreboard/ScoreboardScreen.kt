@@ -95,6 +95,14 @@ import android.os.Build
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material3.Icon
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.platform.LocalHapticFeedback
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.os.VibratorManager
+import androidx.compose.ui.platform.LocalContext
+
+
 
 
 
@@ -323,6 +331,8 @@ fun ScoreboardScreen(
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val haptic = LocalHapticFeedback.current
+
 
     val settingsRepository = remember { SettingsRepositoryImpl(context) }
     val syncRepository = remember { SyncRepository(context, settingsRepository) }
@@ -1606,6 +1616,10 @@ fun ScoreboardScreen(
 
     fun handlePlayerClick(player: String) {
         if (gameFinished) return
+
+        // Лёгкий тактильный “тик” на нажатие
+        haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
+
         when {
             tempScorer == null -> tempScorer = player
             tempAssist1 == null -> tempAssist1 = player
@@ -1615,6 +1629,7 @@ fun ScoreboardScreen(
             }
         }
     }
+
 
     fun exportGameFile(context: Context, file: File) {
         try {
@@ -3267,6 +3282,45 @@ fun ScoreboardScreen(
     if (goalInputTeam != null && !gameFinished) {
         val teamName = if (goalInputTeam == Team.RED) "Красные" else "Белые"
         val players = if (goalInputTeam == Team.RED) playersRed else playersWhite
+        val context = LocalContext.current
+
+        fun vibrateClick() {
+            val vibrator: Vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                val vm = context.getSystemService(VibratorManager::class.java)
+                vm.defaultVibrator
+            } else {
+                @Suppress("DEPRECATION")
+                context.getSystemService(Vibrator::class.java)
+            }
+
+            if (!vibrator.hasVibrator()) return
+
+            // Двойной тактильный "клик"
+            val timings = longArrayOf(
+                0L,   // сразу
+                25L,  // вибрация
+                30L,  // пауза
+                25L   // вибрация
+            )
+
+            val amplitudes = intArrayOf(
+                0,
+                VibrationEffect.DEFAULT_AMPLITUDE,
+                0,
+                VibrationEffect.DEFAULT_AMPLITUDE
+            )
+
+            val effect = VibrationEffect.createWaveform(
+                timings,
+                amplitudes,
+                -1 // без повтора
+            )
+
+            vibrator.vibrate(effect)
+        }
+
+
+
 
         AlertDialog(
             onDismissRequest = { resetGoalInput() },
@@ -3312,13 +3366,37 @@ fun ScoreboardScreen(
                     Spacer(modifier = Modifier.height(4.dp))
 
                     players.forEach { player ->
+                        val role = when (player) {
+                            tempScorer -> "ГОЛ"
+                            tempAssist1 -> "Передача"
+                            tempAssist2 -> "Передача 2"
+                            else -> null
+                        }
+
                         TextButton(
-                            onClick = { handlePlayerClick(player) },
+                            onClick = {
+                                vibrateClick()
+                                handlePlayerClick(player)
+                            },
+
+                            modifier = Modifier.fillMaxWidth(),
+                            contentPadding = PaddingValues(horizontal = 12.dp, vertical = 10.dp),
                             colors = dialogButtonColors()
                         ) {
-                            Text(player, fontSize = 16.sp)
+                            Row(modifier = Modifier.fillMaxWidth()) {
+                                Text(
+                                    text = player,
+                                    fontSize = 16.sp,
+                                    fontWeight = if (role != null) FontWeight.SemiBold else FontWeight.Normal
+                                )
+                                Spacer(modifier = Modifier.weight(1f))
+                                if (role != null) {
+                                    Text(text = role, fontSize = 14.sp)
+                                }
+                            }
                         }
                     }
+
                 }
             },
             confirmButton = {
