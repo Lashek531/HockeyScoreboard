@@ -82,6 +82,17 @@ import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.foundation.layout.BoxWithConstraints
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.core.content.ContextCompat
+import com.example.hockeyscoreboard.esp.EspTabloController
+import android.os.Build
+
 
 
 
@@ -420,7 +431,32 @@ fun ScoreboardScreen(
     var showNewGameConfirm by remember { mutableStateOf(false) }
     var showActionsMenu by remember { mutableStateOf(false) }
     var showTabloRemoteDialog by remember { mutableStateOf(false) }
-    var espStatusLine by remember { mutableStateOf("ESP: неизвестно") }
+
+    val espController = remember {
+        EspTabloController(context.applicationContext)
+    }
+    val espStatus by espController.status.collectAsState()
+
+    val nearbyWifiPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { granted ->
+            if (granted) {
+                espController.startDiscovery()
+            }
+            // если не дали — статус останется “не найдена/поиск…”, это ок для MVP
+        }
+    )
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestPermission(),
+        onResult = { granted ->
+            if (granted) {
+                espController.startDiscovery()
+            }
+            // если не дали — ничего не делаем, диалог покажет текущий статус
+        }
+    )
+
+
 
     var showNoTeamsDialog by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
@@ -1796,6 +1832,45 @@ fun ScoreboardScreen(
             textContentColor = DialogTextColor
         )
     }
+
+    if (showTabloRemoteDialog) {
+        LaunchedEffect(Unit) {
+            if (Build.VERSION.SDK_INT >= 33) {
+                val perm = Manifest.permission.NEARBY_WIFI_DEVICES
+                val hasPerm = ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
+                if (hasPerm) {
+                    espController.startDiscovery()
+                } else {
+                    nearbyWifiPermissionLauncher.launch(perm)
+                }
+            } else {
+                val perm = Manifest.permission.ACCESS_FINE_LOCATION
+                val hasPerm = ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
+                if (hasPerm) {
+                    espController.startDiscovery()
+                } else {
+                    locationPermissionLauncher.launch(perm)
+                }
+            }
+        }
+
+
+        DisposableEffect(Unit) {
+            onDispose { espController.stopDiscovery() }
+        }
+
+        AlertDialog(
+            onDismissRequest = { showTabloRemoteDialog = false },
+            title = { Text("ESP32 табло") },
+            text = { Text(espStatus) },
+            confirmButton = {
+                TextButton(onClick = { showTabloRemoteDialog = false }) {
+                    Text("Закрыть")
+                }
+            }
+        )
+    }
+
 
     // --- ДИАЛОГ: ПОДТВЕРЖДЕНИЕ ИЗМЕНЕНИЯ НАСТРОЕК ---
 
