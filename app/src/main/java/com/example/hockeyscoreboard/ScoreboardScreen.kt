@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.Intent
 import android.widget.Toast
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
@@ -15,6 +16,7 @@ import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material3.*
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
@@ -66,6 +68,26 @@ import org.json.JSONObject
 import org.json.JSONArray
 import com.example.hockeyscoreboard.data.rebuildGamesIndexFromAllSources
 import androidx.compose.material.icons.filled.Send
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.unit.dp
+import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.SettingsRemote
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.TextUnit
+import androidx.compose.foundation.layout.BoxWithConstraints
+
+
+
+
+
+
 
 
 
@@ -291,12 +313,16 @@ fun ScoreboardScreen(
     val raspiRepository = remember { RaspiRepository(settingsRepository) }
 
 
+
+
     var isSyncing by remember { mutableStateOf(false) }
     var serverUrl by remember { mutableStateOf("") }
     var apiKey by remember { mutableStateOf("") }
     var telegramBotToken by remember { mutableStateOf("") }
     var telegramChatId by remember { mutableStateOf("") }
     var telegramBotChatId by remember { mutableStateOf("") }
+    var remoteTabIndex by rememberSaveable { mutableStateOf(0) } // 0=Fast, 1=Full
+
 
     // Снапшот значений настроек на момент открытия диалога
     var initialSeason by remember { mutableStateOf("") }
@@ -385,12 +411,17 @@ fun ScoreboardScreen(
 
     // ФЛАГИ ДИАЛОГОВ / МЕНЮ
     var showBasePlayersDialog by remember { mutableStateOf(false) }
+    var basePlayersDialogSnapshot by remember { mutableStateOf<List<PlayerInfo>>(emptyList()) }
+
     var showLineupsDialog by remember { mutableStateOf(false) }
     var showHistoryDialog by remember { mutableStateOf(false) }
     var showHistoryDetailsDialog by remember { mutableStateOf(false) }
     var showFinishConfirm by remember { mutableStateOf(false) }
     var showNewGameConfirm by remember { mutableStateOf(false) }
     var showActionsMenu by remember { mutableStateOf(false) }
+    var showTabloRemoteDialog by remember { mutableStateOf(false) }
+    var espStatusLine by remember { mutableStateOf("ESP: неизвестно") }
+
     var showNoTeamsDialog by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
     var showManualExportSendDialog by remember { mutableStateOf(false) }
@@ -1616,17 +1647,38 @@ fun ScoreboardScreen(
             )
         },
         floatingActionButton = {
-            FloatingActionButton(
-                onClick = { showActionsMenu = true },
-                containerColor = MaterialTheme.colorScheme.primary
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Icon(
-                    imageVector = Icons.Filled.MoreVert,
-                    contentDescription = "Меню"
-                )
+                // Левая кнопка: пульт управления табло
+                FloatingActionButton(
+                    onClick = { showTabloRemoteDialog = true },
+                    containerColor = MaterialTheme.colorScheme.secondary
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.SettingsRemote,
+                        contentDescription = "Пульт табло"
+                    )
+                }
+
+                // Правая кнопка: меню (три точки)
+                FloatingActionButton(
+                    onClick = { showActionsMenu = true },
+                    containerColor = MaterialTheme.colorScheme.primary
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.MoreVert,
+                        contentDescription = "Меню"
+                    )
+                }
             }
         },
         floatingActionButtonPosition = FabPosition.End,
+
         containerColor = Color(0xFF071422)
     ) { innerPadding ->
         ScoreboardContentView(
@@ -1794,10 +1846,14 @@ fun ScoreboardScreen(
 
     if (showBasePlayersDialog && !gameFinished) {
         AlertDialog(
-            onDismissRequest = { showBasePlayersDialog = false },
+            onDismissRequest = {
+                basePlayers = basePlayersDialogSnapshot
+                showBasePlayersDialog = false
+            },
             title = { Text("Базовый список игроков", fontSize = 20.sp) },
             text = {
-                Column(
+
+            Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 200.dp, max = 500.dp)
@@ -2039,7 +2095,19 @@ fun ScoreboardScreen(
                     Text("Сохранить", fontSize = 16.sp)
                 }
             },
+            dismissButton = {
+                TextButton(
+                    onClick = {
+                        basePlayers = basePlayersDialogSnapshot
+                        showBasePlayersDialog = false
+                    },
+                    colors = dialogButtonColors()
+                ) {
+                    Text("Отмена", fontSize = 16.sp)
+                }
+            },
             containerColor = DialogBackground,
+
             titleContentColor = DialogTitleColor,
             textContentColor = DialogTextColor
         )
@@ -2211,7 +2279,9 @@ fun ScoreboardScreen(
                         onClick = {
                             showSettingsDialog = false
                             if (!gameFinished) {
+                                basePlayersDialogSnapshot = basePlayers
                                 showBasePlayersDialog = true
+
                             }
                         },
                         enabled = !gameFinished,
