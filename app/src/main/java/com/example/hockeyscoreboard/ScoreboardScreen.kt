@@ -91,6 +91,8 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.core.content.ContextCompat
 import com.example.hockeyscoreboard.esp.EspTabloController
+import com.example.hockeyscoreboard.esp.TabloScoreLayout
+import com.example.hockeyscoreboard.esp.buttonFor
 import android.os.Build
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Remove
@@ -146,7 +148,10 @@ data class ActiveGameSnapshot(
     val rosterChanges: List<RosterChangeEvent>,
     val gameStartMillis: Long,      // всегда НЕ null
     val finished: Boolean,
-    val externalEventId: String?
+    val externalEventId: String?,
+    // Какая команда сейчас находится СЛЕВА на физическом табло (счёт слева: + = "1", − = "4").
+    // Нужен для корректной синхронизации счёта при добавлении/удалении гола и при смене сторон между таймами.
+    val tabloLeftTeam: Team
 )
 
 
@@ -275,6 +280,17 @@ fun loadActiveGameSnapshotOrNull(context: Context): ActiveGameSnapshot? {
             )
         }
 
+        // --- Настройки физического табло ---
+        // По умолчанию (если поля нет) считаем, что слева на табло "Красные" —
+        // это соответствует текущей раскладке в UI (Красные слева, Белые справа).
+        val tabloLeftTeam: Team = root.optJSONObject("tablo")
+            ?.optString("leftTeam", "RED")
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.let { value ->
+                try { Team.valueOf(value) } catch (_: Exception) { Team.RED }
+            } ?: Team.RED
+
         ActiveGameSnapshot(
             season = season,
             playersRed = playersRed,
@@ -283,7 +299,8 @@ fun loadActiveGameSnapshotOrNull(context: Context): ActiveGameSnapshot? {
             rosterChanges = rosterChanges,
             gameStartMillis = gameStartMillis,
             finished = finished,
-            externalEventId = externalEventId
+            externalEventId = externalEventId,
+            tabloLeftTeam = tabloLeftTeam
         )
     } catch (e: Exception) {
         e.printStackTrace()
@@ -472,6 +489,20 @@ fun ScoreboardScreen(
         }
     )
 
+    // Если разрешение уже выдано ранее, запускаем discovery сразу при открытии экрана,
+    // чтобы синхронизация счёта (при добавлении/удалении гола) работала без обязательного открытия диалога.
+    LaunchedEffect(Unit) {
+        val perm = if (Build.VERSION.SDK_INT >= 33) {
+            Manifest.permission.NEARBY_WIFI_DEVICES
+        } else {
+            Manifest.permission.ACCESS_FINE_LOCATION
+        }
+        val hasPerm = ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
+        if (hasPerm) {
+            espController.startDiscovery()
+        }
+    }
+
 
 
     var showNoTeamsDialog by remember { mutableStateOf(false) }
@@ -513,6 +544,10 @@ fun ScoreboardScreen(
 
     val redScore = goals.count { it.team == Team.RED }
     val whiteScore = goals.count { it.team == Team.WHITE }
+
+    // Какая команда находится СЛЕВА на физическом табло.
+    // По умолчанию совпадает с UI (Красные слева), но может быть переключено в перерыве.
+    var tabloLeftTeam by rememberSaveable { mutableStateOf(Team.RED) }
 
     // Снапшоты составов на момент открытия диалога "Составы команд"
     var lastLineupsRedSnapshot by remember { mutableStateOf<List<String>>(emptyList()) }
@@ -574,6 +609,9 @@ fun ScoreboardScreen(
         playersRedText = ""
         playersWhiteText = ""
 
+        // стороны счёта на физическом табло
+        tabloLeftTeam = Team.RED
+
         // очищаем снапшоты составов
         lastLineupsRedSnapshot = emptyList()
         lastLineupsWhiteSnapshot = emptyList()
@@ -609,6 +647,9 @@ fun ScoreboardScreen(
 
         // Восстанавливаем внешний EventID (и в prefs тоже)
         updateExternalEventId(snapshot.externalEventId)
+
+        // Стороны счёта на физическом табло
+        tabloLeftTeam = snapshot.tabloLeftTeam
 
         // Пересчитываем следующие идентификаторы и порядок событий
         nextGoalId = (goals.maxOfOrNull { it.id } ?: 0L) + 1L
@@ -770,6 +811,13 @@ fun ScoreboardScreen(
         teamsObj.put("RED", redObj)
         teamsObj.put("WHITE", whiteObj)
         root.put("teams", teamsObj)
+
+        // --- Настройки физического табло ---
+        // leftTeam определяет, какая команда находится СЛЕВА (кнопки счёта слева: +="1", −="4").
+        root.put(
+            "tablo",
+            org.json.JSONObject().put("leftTeam", tabloLeftTeam.name)
+        )
 
         val currentRedScore = goals.count { it.team == Team.RED }
         val currentWhiteScore = goals.count { it.team == Team.WHITE }
@@ -1575,12 +1623,22 @@ fun ScoreboardScreen(
         Toast.makeText(context, msg, Toast.LENGTH_LONG).show()
     }
 
+    // Синхронизация счёта с физическим табло при добавлении/удалении/переносе гола.
+    // Использует текущее значение tabloLeftTeam для выбора "левого" или "правого" счёта.
+    fun sendScoreDeltaToTablo(team: Team, delta: Int) {
+        val btn = TabloScoreLayout(tabloLeftTeam).buttonFor(team, delta) ?: return
+        scope.launch { espController.press(btn) }
+    }
+
     fun commitGoalIfPossible() {
         if (gameFinished) return
 
         val team = goalInputTeam ?: return
         val scorer = tempScorer ?: return
         val id = editingGoalId ?: nextGoalId++
+
+        // Если редактируем существующий гол — фиксируем команду ДО изменения
+        val prevTeam: Team? = editingGoalId?.let { editId -> goals.find { it.id == editId }?.team }
 
         val existingOrder = goals.find { it.id == id }?.eventOrder
         val order = existingOrder ?: nextEventOrder++
@@ -1606,6 +1664,18 @@ fun ScoreboardScreen(
             goals + newEvent
         } else {
             goals.map { if (it.id == editingGoalId) newEvent else it }
+        }
+
+        // --- Синхронизация счёта на физическом табло ---
+        if (editingGoalId == null) {
+            // новый гол
+            sendScoreDeltaToTablo(team, +1)
+        } else {
+            // редактирование: если команда изменилась — уменьшаем старую и увеличиваем новую
+            if (prevTeam != null && prevTeam != team) {
+                sendScoreDeltaToTablo(prevTeam, -1)
+                sendScoreDeltaToTablo(team, +1)
+            }
         }
 
         notifyGameJsonUpdated(isFinal = false)
@@ -1939,6 +2009,27 @@ fun ScoreboardScreen(
                             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                                 Text("Счёт")
 
+                                // Стороны счёта на физическом табло (нужно при смене сторон между таймами)
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    val leftName = if (tabloLeftTeam == Team.RED) "Красные" else "Белые"
+                                    Text("Слева: $leftName")
+
+                                    OutlinedButton(
+                                        onClick = {
+                                            tabloLeftTeam = if (tabloLeftTeam == Team.RED) Team.WHITE else Team.RED
+                                            // чтобы переживало перезапуск и ушло в active_game.json
+                                            notifyGameJsonUpdated(isFinal = false)
+                                        },
+                                        modifier = Modifier.height(36.dp)
+                                    ) {
+                                        Text("Поменять", maxLines = 1)
+                                    }
+                                }
+
                                 // 2×2: слева (левый счёт), справа (правый счёт)
                                 Row(
                                     modifier = Modifier.fillMaxWidth(),
@@ -2250,7 +2341,7 @@ fun ScoreboardScreen(
             title = { Text("Базовый список игроков", fontSize = 20.sp) },
             text = {
 
-            Column(
+                Column(
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = 200.dp, max = 500.dp)
@@ -3445,6 +3536,8 @@ fun ScoreboardScreen(
                 ) {
                     TextButton(
                         onClick = {
+                            // уменьшить счёт на физическом табло
+                            sendScoreDeltaToTablo(goal.team, -1)
                             goals = goals.filterNot { it.id == goal.id }
                             goalOptionsFor = null
                             notifyGameJsonUpdated(isFinal = false)
