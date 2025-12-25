@@ -33,6 +33,7 @@ fun ScoreboardContentView(
     gameFinished: Boolean,
     onTeamClick: (Team) -> Unit,
     onGoalClick: (GoalEvent) -> Unit,
+    leftTeam: Team = Team.RED,
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
@@ -52,25 +53,40 @@ fun ScoreboardContentView(
             verticalAlignment = Alignment.Top
         ) {
 
+            val leftIsRed = leftTeam == Team.RED
+
+            val leftName = if (leftIsRed) "Красные" else "Белые"
+            val leftScore = if (leftIsRed) redScore else whiteScore
+            val leftBg = if (leftIsRed) Color(0xFFB71C1C) else Color(0xFFE0E0E0)
+            val leftText = if (leftIsRed) Color(0xFFFFF8E1) else Color(0xFF071422)
+            val leftClickTeam = if (leftIsRed) Team.RED else Team.WHITE
+
+            val rightName = if (leftIsRed) "Белые" else "Красные"
+            val rightScore = if (leftIsRed) whiteScore else redScore
+            val rightBg = if (leftIsRed) Color(0xFFE0E0E0) else Color(0xFFB71C1C)
+            val rightText = if (leftIsRed) Color(0xFF071422) else Color(0xFFFFF8E1)
+            val rightClickTeam = if (leftIsRed) Team.WHITE else Team.RED
+
             TeamScoreCardView(
-                teamName = "Красные",
-                score = redScore,
-                backgroundColor = Color(0xFFB71C1C),
-                textColor = Color(0xFFFFF8E1),
+                teamName = leftName,
+                score = leftScore,
+                backgroundColor = leftBg,
+                textColor = leftText,
                 modifier = Modifier.weight(1f),
-                onClick = { onTeamClick(Team.RED) }
+                onClick = { onTeamClick(leftClickTeam) }
             )
 
             Spacer(modifier = Modifier.width(16.dp))
 
             TeamScoreCardView(
-                teamName = "Белые",
-                score = whiteScore,
-                backgroundColor = Color(0xFFCFD8DC),
-                textColor = Color(0xFF263238),
+                teamName = rightName,
+                score = rightScore,
+                backgroundColor = rightBg,
+                textColor = rightText,
                 modifier = Modifier.weight(1f),
-                onClick = { onTeamClick(Team.WHITE) }
+                onClick = { onTeamClick(rightClickTeam) }
             )
+
         }
 
         Spacer(modifier = Modifier.height(16.dp))

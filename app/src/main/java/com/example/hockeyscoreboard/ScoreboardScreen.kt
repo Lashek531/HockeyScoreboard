@@ -1630,6 +1630,39 @@ fun ScoreboardScreen(
         scope.launch { espController.press(btn) }
     }
 
+    fun onChangePeriodPressed() {
+        if (gameFinished) return
+
+        // Счёт, который физически сейчас слева/справа (по текущей раскладке)
+        val leftScoreBefore = if (tabloLeftTeam == Team.RED) redScore else whiteScore
+        val rightScoreBefore = if (tabloLeftTeam == Team.RED) whiteScore else redScore
+
+        // После смены сторон слева будет другая команда => на левую сторону должен переехать другой счёт
+        val leftScoreAfter = rightScoreBefore
+        val rightScoreAfter = leftScoreBefore
+
+        val deltaLeft = leftScoreAfter - leftScoreBefore
+        val deltaRight = rightScoreAfter - rightScoreBefore
+
+        scope.launch {
+            // 1) Тайм +1 на физическом табло (это реально используемая кнопка в твоём пульте)
+            espController.press("2")
+
+            // 2) Поправляем ЛЕВЫЙ счёт физического табло до нужного значения
+            if (deltaLeft > 0) espController.sendPresses("1", deltaLeft)
+            if (deltaLeft < 0) espController.sendPresses("4", -deltaLeft)
+
+            // 3) Поправляем ПРАВЫЙ счёт физического табло
+            if (deltaRight > 0) espController.sendPresses("3", deltaRight)
+            if (deltaRight < 0) espController.sendPresses("6", -deltaRight)
+
+            // 4) Теперь фиксируем смену сторон в приложении (и в active_game.json)
+            tabloLeftTeam = if (tabloLeftTeam == Team.RED) Team.WHITE else Team.RED
+            notifyGameJsonUpdated(isFinal = false)
+        }
+    }
+
+
     fun commitGoalIfPossible() {
         if (gameFinished) return
 
@@ -1781,18 +1814,35 @@ fun ScoreboardScreen(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Левая кнопка: пульт управления табло
-                FloatingActionButton(
-                    onClick = { showTabloRemoteDialog = true },
-                    containerColor = MaterialTheme.colorScheme.secondary
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.SettingsRemote,
-                        contentDescription = "Пульт табло"
-                    )
+                // Слева: две кнопки рядом
+                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+
+                    // Пульт табло
+                    FloatingActionButton(
+                        onClick = { showTabloRemoteDialog = true },
+                        containerColor = MaterialTheme.colorScheme.secondary
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.SettingsRemote,
+                            contentDescription = "Пульт табло"
+                        )
+                    }
+
+                    // Смена тайма
+                    FloatingActionButton(
+                        onClick = { onChangePeriodPressed() },
+                        containerColor = MaterialTheme.colorScheme.secondary
+                    ) {
+                        // Используем существующую иконку (без новых импортов),
+                        // чтобы не рисковать “Unresolved reference”.
+                        Icon(
+                            imageVector = Icons.Filled.Add,
+                            contentDescription = "Смена тайма"
+                        )
+                    }
                 }
 
-                // Правая кнопка: меню (три точки)
+                // Справа: меню
                 FloatingActionButton(
                     onClick = { showActionsMenu = true },
                     containerColor = MaterialTheme.colorScheme.primary
@@ -1803,6 +1853,7 @@ fun ScoreboardScreen(
                     )
                 }
             }
+
         },
         floatingActionButtonPosition = FabPosition.End,
 
@@ -1815,10 +1866,10 @@ fun ScoreboardScreen(
             gameFinished = gameFinished,
             onTeamClick = { team -> startNewGoal(team) },
             onGoalClick = { goal -> goalOptionsFor = goal },
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(innerPadding)
+            leftTeam = tabloLeftTeam,
+            modifier = Modifier.padding(innerPadding)
         )
+
     }
 
     // --- ДИАЛОГ: МЕНЮ ДЕЙСТВИЙ ---
