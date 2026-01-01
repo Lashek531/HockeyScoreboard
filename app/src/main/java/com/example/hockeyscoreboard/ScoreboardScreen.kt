@@ -478,8 +478,10 @@ fun ScoreboardScreen(
         espController.startHealthMonitor()
         onDispose {
             espController.stopHealthMonitor()
+            espController.stopDiscovery()
         }
     }
+
 
     val nearbyWifiPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
@@ -504,16 +506,25 @@ fun ScoreboardScreen(
     // Если разрешение уже выдано ранее, запускаем discovery сразу при открытии экрана,
     // чтобы синхронизация счёта (при добавлении/удалении гола) работала без обязательного открытия диалога.
     LaunchedEffect(Unit) {
-        val perm = if (Build.VERSION.SDK_INT >= 33) {
-            Manifest.permission.NEARBY_WIFI_DEVICES
+        if (Build.VERSION.SDK_INT >= 33) {
+            val perm = Manifest.permission.NEARBY_WIFI_DEVICES
+            val hasPerm = ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
+            if (hasPerm) {
+                espController.startDiscovery()
+            } else {
+                nearbyWifiPermissionLauncher.launch(perm)
+            }
         } else {
-            Manifest.permission.ACCESS_FINE_LOCATION
-        }
-        val hasPerm = ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
-        if (hasPerm) {
-            espController.startDiscovery()
+            val perm = Manifest.permission.ACCESS_FINE_LOCATION
+            val hasPerm = ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
+            if (hasPerm) {
+                espController.startDiscovery()
+            } else {
+                locationPermissionLauncher.launch(perm)
+            }
         }
     }
+
 
 
 
@@ -2170,30 +2181,7 @@ fun ScoreboardScreen(
     }
 
     if (showTabloRemoteDialog) {
-        LaunchedEffect(Unit) {
-            if (Build.VERSION.SDK_INT >= 33) {
-                val perm = Manifest.permission.NEARBY_WIFI_DEVICES
-                val hasPerm = ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
-                if (hasPerm) {
-                    espController.startDiscovery()
-                } else {
-                    nearbyWifiPermissionLauncher.launch(perm)
-                }
-            } else {
-                val perm = Manifest.permission.ACCESS_FINE_LOCATION
-                val hasPerm = ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
-                if (hasPerm) {
-                    espController.startDiscovery()
-                } else {
-                    locationPermissionLauncher.launch(perm)
-                }
-            }
-        }
 
-
-        DisposableEffect(Unit) {
-            onDispose { espController.stopDiscovery() }
-        }
 
         AlertDialog(
             onDismissRequest = { showTabloRemoteDialog = false },
