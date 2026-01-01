@@ -23,6 +23,7 @@ import java.net.InetAddress
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 data class EspEndpoint(val host: InetAddress, val port: Int)
@@ -30,21 +31,25 @@ data class EspEndpoint(val host: InetAddress, val port: Int)
 class EspTabloController(
     appContext: Context
 ) {
-
     companion object {
         private const val SERVICE_TYPE = "_hockeytablo._udp."
         private const val DEFAULT_PORT = 4210
 
-        private const val ACK_TIMEOUT_MS = 500
-        private const val RETRIES = 3
-        private const val RETRY_DELAY_MS = 120L
+        // --- ЛОГ ---
         private const val MAX_LOG_LINES = 5000
         private const val TRIM_EVERY_N_LINES = 100
         private const val TRIM_MIN_INTERVAL_MS = 30_000L
-        private const val PINGPONG_TIMEOUT_MS = 1500
-        private const val PINGPONG_FAILS_TO_REDISCOVER = 5
-        private const val PINGPONG_INTERVAL_MS = 5000L
 
+        // --- HEALTH (PING/PONG) ---
+        private const val PINGPONG_TIMEOUT_MS = 1500
+        private const val PINGPONG_INTERVAL_MS = 5000L
+        private const val PINGPONG_FAILS_TO_REDISCOVER = 5
+
+        // --- UDP ACK для управляющих команд (PRESS/SIREN) ---
+        // 500ms слишком впритык (у вас уже были 503ms/ретраи)
+        private const val CMD_ACK_TIMEOUT_MS = 800
+        private const val RETRIES = 3
+        private const val RETRY_DELAY_MS = 120L
     }
 
     private val appCtx: Context = appContext.applicationContext
@@ -67,9 +72,12 @@ class EspTabloController(
     private var resolveInProgress = false
     private val resolveLock = Any()
 
-
     // Очередь команд: строго 1 активная команда
     private val sendMutex = Mutex()
+
+    // Отдельный флаг, чтобы health-check не конкурировал с отправкой команд и не грузил ESP
+    private val busySending = AtomicBoolean(false)
+
     private val idGen = AtomicInteger(1)
 
     // -------------------- ЛОГИ --------------------
@@ -97,8 +105,6 @@ class EspTabloController(
         }
     }
 
-
-
     private fun logLine(message: String) {
         runCatching {
             val ts = logTsFmt.format(Date())
@@ -117,16 +123,14 @@ class EspTabloController(
         }
     }
 
-
-
     fun getLogFilePath(): String = logFile.absolutePath
+
     suspend fun readLogLinesNewestFirst(): List<String> = withContext(Dispatchers.IO) {
         if (!logFile.exists()) return@withContext emptyList()
-        // Берём все строки и разворачиваем: последние сверху
         logFile.readLines(Charsets.UTF_8).asReversed()
     }
 
-    // -------------------- HEALTH MONITOR (HTTP /ping) --------------------
+    // -------------------- HEALTH MONITOR (PING/PONG) --------------------
 
     private val ioScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var healthJob: Job? = null
@@ -155,7 +159,6 @@ class EspTabloController(
 
                 val rtt = System.currentTimeMillis() - start
                 val resp = String(inp.data, 0, inp.length, Charsets.UTF_8).trim()
-
                 Pair(resp == "PONG", rtt)
             } catch (t: Throwable) {
                 val rtt = System.currentTimeMillis() - start
@@ -165,9 +168,8 @@ class EspTabloController(
         }
     }
 
-
     /**
-     * Запускаем мониторинг доступности ESP по HTTP /ping каждые 5 секунд.
+     * Мониторинг доступности ESP каждые PINGPONG_INTERVAL_MS.
      * Повторный вызов не создаёт второй job.
      */
     fun startHealthMonitor() {
@@ -185,28 +187,30 @@ class EspTabloController(
                     } else {
                         logLine("HEALTH no-endpoint (discovery running)")
                     }
-                }
- else {
-                    val (ok, rtt) = pingPongOnce(ep)
-                    if (ok) {
-                        consecutivePingFails = 0
-                        logLine("PING ok rtt=${rtt}ms ep=${ep.host.hostAddress}:${ep.port}")
+                } else {
+                    // Если в данный момент активно шлём команды — не дёргаем ESP параллельными PING
+                    if (busySending.get()) {
+                        logLine("PING skip (busy sending)")
                     } else {
-                        consecutivePingFails++
-                        logLine("PING FAIL #$consecutivePingFails rtt=${rtt}ms ep=${ep.host.hostAddress}:${ep.port}")
+                        val (ok, rtt) = pingPongOnce(ep)
+                        if (ok) {
+                            consecutivePingFails = 0
+                            _status.value = "ESP: OK ${ep.host.hostAddress}:${ep.port} (rtt=${rtt}ms)"
+                            logLine("PING ok rtt=${rtt}ms ep=${ep.host.hostAddress}:${ep.port}")
+                        } else {
+                            consecutivePingFails++
+                            _status.value = "ESP: ping fail #$consecutivePingFails (rtt=${rtt}ms)"
+                            logLine("PING FAIL #$consecutivePingFails rtt=${rtt}ms ep=${ep.host.hostAddress}:${ep.port}")
 
-                        // Если несколько подряд — считаем, что ESP отвалилась, и запускаем переобнаружение
-                        if (consecutivePingFails >= PINGPONG_FAILS_TO_REDISCOVER) {
-                            _status.value = "ESP: ping fail (re-discovery)"
-                            // endpoint НЕ сбрасываем: UDP может продолжать работать даже если HTTP недоступен
-                            withContext(Dispatchers.Main) { startDiscovery() }
+                            if (consecutivePingFails >= PINGPONG_FAILS_TO_REDISCOVER) {
+                                _status.value = "ESP: ping fail (re-discovery)"
+                                withContext(Dispatchers.Main) { startDiscovery() }
+                            }
                         }
-
                     }
                 }
 
                 delay(PINGPONG_INTERVAL_MS)
-
             }
         }
     }
@@ -254,7 +258,6 @@ class EspTabloController(
                     object : NsdManager.ResolveListener {
                         override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
                             synchronized(resolveLock) { resolveInProgress = false }
-
                             logLine("DISCOVERY resolve FAILED code=$errorCode name=${serviceInfo.serviceName}")
                             _status.value = "ESP: resolve ошибка ($errorCode)"
                         }
@@ -279,9 +282,9 @@ class EspTabloController(
             }
 
             override fun onServiceLost(serviceInfo: NsdServiceInfo) {
-                _endpoint.value = null
+                // В реальности mDNS может “флапать”. Не сносим endpoint мгновенно — иначе UI начинает дёргаться.
                 logLine("DISCOVERY lost name=${serviceInfo.serviceName}")
-                _status.value = "ESP: потеряна, поиск…"
+                _status.value = "ESP: mDNS lost (keep last endpoint)"
             }
 
             override fun onDiscoveryStopped(serviceType: String) {
@@ -329,7 +332,6 @@ class EspTabloController(
 
     /**
      * Переводит физическое табло из режима часов в режим хоккейного табло.
-     *
      * По ТЗ это тройное нажатие кнопки «выход».
      */
     suspend fun switchToScoreboardMode(): Boolean = sendPresses("выход", 3)
@@ -338,20 +340,25 @@ class EspTabloController(
         if (count <= 0) return true
 
         return sendMutex.withLock {
-            val ep = endpoint.value
-            if (ep == null) {
-                _status.value = "ESP: не найдена (повторный поиск)"
-                withContext(Dispatchers.Main) { startDiscovery() }
-                return@withLock false
-            }
+            busySending.set(true)
+            try {
+                val ep = endpoint.value
+                if (ep == null) {
+                    _status.value = "ESP: не найдена (повторный поиск)"
+                    withContext(Dispatchers.Main) { startDiscovery() }
+                    return@withLock false
+                }
 
-            var okAll = true
-            for (i in 0 until count) {
-                val ok = sendOnceWithRetries(ep, btn)
-                okAll = okAll && ok
-                if (!ok) break
+                var okAll = true
+                for (i in 0 until count) {
+                    val ok = sendOnceWithRetries(ep, btn)
+                    okAll = okAll && ok
+                    if (!ok) break
+                }
+                okAll
+            } finally {
+                busySending.set(false)
             }
-            okAll
         }
     }
 
@@ -367,14 +374,19 @@ class EspTabloController(
         if (offMs.size != count) return false
 
         return sendMutex.withLock {
-            val ep = endpoint.value
-            if (ep == null) {
-                _status.value = "ESP: не найдена (повторный поиск)"
-                withContext(Dispatchers.Main) { startDiscovery() }
-                return@withLock false
-            }
+            busySending.set(true)
+            try {
+                val ep = endpoint.value
+                if (ep == null) {
+                    _status.value = "ESP: не найдена (повторный поиск)"
+                    withContext(Dispatchers.Main) { startDiscovery() }
+                    return@withLock false
+                }
 
-            sendSirenOnceWithRetries(ep, onMs, offMs)
+                sendSirenOnceWithRetries(ep, onMs, offMs)
+            } finally {
+                busySending.set(false)
+            }
         }
     }
 
@@ -398,7 +410,7 @@ class EspTabloController(
         val data = payload.toByteArray(Charsets.UTF_8)
 
         DatagramSocket().use { socket ->
-            socket.soTimeout = ACK_TIMEOUT_MS
+            socket.soTimeout = CMD_ACK_TIMEOUT_MS
 
             for (attempt in 0 until RETRIES) {
                 val attemptNo = attempt + 1
@@ -464,7 +476,7 @@ class EspTabloController(
             val data = payload.toByteArray(Charsets.UTF_8)
 
             DatagramSocket().use { socket ->
-                socket.soTimeout = ACK_TIMEOUT_MS
+                socket.soTimeout = CMD_ACK_TIMEOUT_MS
 
                 for (attempt in 0 until RETRIES) {
                     val attemptNo = attempt + 1
