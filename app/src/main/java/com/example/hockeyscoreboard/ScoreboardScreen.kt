@@ -103,6 +103,9 @@ import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
 import androidx.compose.ui.platform.LocalContext
+import android.os.SystemClock
+import kotlinx.coroutines.delay
+
 
 
 
@@ -153,6 +156,9 @@ data class ActiveGameSnapshot(
     // Нужен для корректной синхронизации счёта при добавлении/удалении гола и при смене сторон между таймами.
     val tabloLeftTeam: Team
 )
+
+private enum class ShiftTimerPhase { SHIFT, BREAK }
+
 
 
 // Загрузка снапшота активной незавершённой игры из active_game.json
@@ -564,6 +570,126 @@ fun ScoreboardScreen(
 
 
     var gameFinished by rememberSaveable { mutableStateOf(false) }
+
+    // ===================== ТАЙМЕР СМЕН (2:00 + 0:12) =====================
+    val shiftDurationMs = 2 * 60 * 1000L
+    val breakDurationMs = 12 * 1000L
+
+    var shiftTimerRunning by remember { mutableStateOf(false) }
+    var shiftTimerPhase by remember { mutableStateOf(ShiftTimerPhase.SHIFT) }
+    var shiftTimerRemainingMs by remember { mutableStateOf(shiftDurationMs) }
+
+    fun formatMmSs(ms: Long): String {
+        val totalSec = (ms / 1000L).toInt()
+        val mm = totalSec / 60
+        val ss = totalSec % 60
+        return "%02d:%02d".format(mm, ss)
+    }
+
+    val shiftTimerPhaseText = if (shiftTimerPhase == ShiftTimerPhase.SHIFT) "Смена" else "Перерыв"
+    val shiftTimerText = formatMmSs(shiftTimerRemainingMs)
+
+    // В начале каждой смены: STOP -> RESET -> START (как вы подтвердили)
+    fun sendExternalShiftStartSignals() {
+        scope.launch {
+            espController.press("9")            // STOP/PAUSE
+            espController.sendPresses("8", 3)   // RESET (x3)
+            espController.press("-")            // START
+        }
+    }
+
+    fun sendSirenShiftStart() {
+        scope.launch {
+            espController.sendSiren(
+                onMs = listOf(300, 300),
+                offMs = listOf(500, 0)
+            )
+        }
+    }
+
+    fun sendSirenShiftEnd() {
+        scope.launch {
+            espController.sendSiren(
+                onMs = listOf(1000),
+                offMs = listOf(0)
+            )
+        }
+    }
+
+    val onShiftTimerStart: () -> Unit = {
+        if (!gameFinished && !shiftTimerRunning) {
+            shiftTimerRunning = true
+
+            // Запуск смены "с нуля" -> синхронизируем внешнее табло и даём стартовый гудок
+            if (shiftTimerPhase == ShiftTimerPhase.SHIFT && shiftTimerRemainingMs == shiftDurationMs) {
+                sendExternalShiftStartSignals()
+                sendSirenShiftStart()
+            } else if (shiftTimerPhase == ShiftTimerPhase.SHIFT) {
+                // Resume во время смены — просто START
+                scope.launch { espController.press("-") }
+            }
+        }
+    }
+
+    val onShiftTimerPause: () -> Unit = {
+        if (!gameFinished && shiftTimerRunning) {
+            shiftTimerRunning = false
+            scope.launch { espController.press("9") } // STOP
+        }
+    }
+
+    val onShiftTimerReset: () -> Unit = {
+        if (!gameFinished) {
+            shiftTimerRunning = false
+            shiftTimerPhase = ShiftTimerPhase.SHIFT
+            shiftTimerRemainingMs = shiftDurationMs
+
+            // STOP + RESET (без START)
+            scope.launch {
+                espController.press("9")
+                espController.sendPresses("8", 3)
+            }
+        }
+    }
+
+// Авто-остановка таймера при завершении игры
+    LaunchedEffect(gameFinished) {
+        if (gameFinished) shiftTimerRunning = false
+    }
+
+// Основной тик таймера
+    LaunchedEffect(shiftTimerRunning, shiftTimerPhase, gameFinished) {
+        if (!shiftTimerRunning || gameFinished) return@LaunchedEffect
+
+        var lastTs = SystemClock.elapsedRealtime()
+        while (shiftTimerRunning && !gameFinished) {
+            delay(100)
+
+            val nowTs = SystemClock.elapsedRealtime()
+            val dt = nowTs - lastTs
+            lastTs = nowTs
+
+            val newRemaining = shiftTimerRemainingMs - dt
+            if (newRemaining > 0) {
+                shiftTimerRemainingMs = newRemaining
+                continue
+            }
+
+            if (shiftTimerPhase == ShiftTimerPhase.SHIFT) {
+                // Конец смены -> длинный гудок -> перерыв 12 сек (без звука на старте перерыва)
+                sendSirenShiftEnd()
+                shiftTimerPhase = ShiftTimerPhase.BREAK
+                shiftTimerRemainingMs = breakDurationMs
+            } else {
+                // Конец перерыва -> новая смена 2:00 -> STOP/RESET/START + двойной гудок
+                shiftTimerPhase = ShiftTimerPhase.SHIFT
+                shiftTimerRemainingMs = shiftDurationMs
+                sendExternalShiftStartSignals()
+                sendSirenShiftStart()
+            }
+        }
+    }
+
     LaunchedEffect(Unit) {
         serverUrl = settingsRepository.getServerUrl()
         apiKey = settingsRepository.getApiKey()
@@ -1806,56 +1932,106 @@ fun ScoreboardScreen(
                 )
             )
         },
-        floatingActionButton = {
-            Row(
+
+        bottomBar = {
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .padding(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                    .navigationBarsPadding()
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
             ) {
-                // Слева: две кнопки рядом
-                Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                // --- Таймер снизу, но выше кнопок ---
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = CardDefaults.cardColors(containerColor = Color(0xFF0A1B2E))
+                ) {
+                    Column(modifier = Modifier.padding(12.dp)) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = shiftTimerPhaseText,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = Color(0xFFB0BEC5)
+                                )
+                                Text(
+                                    text = shiftTimerText,
+                                    style = MaterialTheme.typography.headlineMedium,
+                                    fontWeight = FontWeight.Bold,
+                                    color = Color(0xFFECEFF1)
+                                )
+                            }
 
-                    // Пульт табло
-                    FloatingActionButton(
-                        onClick = { showTabloRemoteDialog = true },
-                        containerColor = MaterialTheme.colorScheme.secondary
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.SettingsRemote,
-                            contentDescription = "Пульт табло"
-                        )
-                    }
+                            Spacer(modifier = Modifier.width(12.dp))
 
-                    // Смена тайма
-                    FloatingActionButton(
-                        onClick = { onChangePeriodPressed() },
-                        containerColor = MaterialTheme.colorScheme.secondary
-                    ) {
-                        // Используем существующую иконку (без новых импортов),
-                        // чтобы не рисковать “Unresolved reference”.
-                        Icon(
-                            imageVector = Icons.Filled.Add,
-                            contentDescription = "Смена тайма"
-                        )
+                            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                OutlinedButton(
+                                    onClick = onShiftTimerStart,
+                                    enabled = !gameFinished,
+                                    modifier = Modifier.width(120.dp).height(40.dp)
+                                ) { Text("Старт") }
+
+                                OutlinedButton(
+                                    onClick = onShiftTimerPause,
+                                    enabled = !gameFinished,
+                                    modifier = Modifier.width(120.dp).height(40.dp)
+                                ) { Text("Пауза") }
+
+                                OutlinedButton(
+                                    onClick = onShiftTimerReset,
+                                    enabled = !gameFinished,
+                                    modifier = Modifier.width(120.dp).height(40.dp)
+                                ) { Text("Сброс") }
+                            }
+                        }
                     }
                 }
 
-                // Справа: меню
-                FloatingActionButton(
-                    onClick = { showActionsMenu = true },
-                    containerColor = MaterialTheme.colorScheme.primary
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // --- Ваши 3 кнопки управления, как и было, но теперь НЕ поверх контента ---
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Icon(
-                        imageVector = Icons.Filled.MoreVert,
-                        contentDescription = "Меню"
-                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        FloatingActionButton(
+                            onClick = { showTabloRemoteDialog = true },
+                            containerColor = MaterialTheme.colorScheme.secondary
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.SettingsRemote,
+                                contentDescription = "Пульт табло"
+                            )
+                        }
+
+                        FloatingActionButton(
+                            onClick = { onChangePeriodPressed() },
+                            containerColor = MaterialTheme.colorScheme.secondary
+                        ) {
+                            Icon(
+                                imageVector = Icons.Filled.Add,
+                                contentDescription = "Смена тайма"
+                            )
+                        }
+                    }
+
+                    FloatingActionButton(
+                        onClick = { showActionsMenu = true },
+                        containerColor = MaterialTheme.colorScheme.primary
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.MoreVert,
+                            contentDescription = "Меню"
+                        )
+                    }
                 }
             }
-
         },
-        floatingActionButtonPosition = FabPosition.End,
+
 
         containerColor = Color(0xFF071422)
     ) { innerPadding ->
@@ -1868,6 +2044,9 @@ fun ScoreboardScreen(
             onGoalClick = { goal -> goalOptionsFor = goal },
             leftTeam = tabloLeftTeam,
             modifier = Modifier.padding(innerPadding)
+
+
+
         )
 
     }
@@ -3472,7 +3651,7 @@ fun ScoreboardScreen(
                         "Новый гол ($teamName)"
                     else
                         "Изменить гол ($teamName)",
-                    fontSize = 20.sp
+                    fontSize = 22.sp
                 )
             },
             text = {
@@ -3484,18 +3663,18 @@ fun ScoreboardScreen(
                 ) {
                     Text(
                         text = "Забил: ${tempScorer ?: "не выбран"}",
-                        fontSize = 18.sp,
+                        fontSize = 22.sp,
                         fontWeight = FontWeight.SemiBold,
                         color = DialogTitleColor
                     )
                     Text(
                         text = "Передача 1: ${tempAssist1 ?: "не выбрана"}",
-                        fontSize = 18.sp,
+                        fontSize = 22.sp,
                         color = DialogTextColor
                     )
                     Text(
                         text = "Передача 2: ${tempAssist2 ?: "не выбрана"}",
-                        fontSize = 18.sp,
+                        fontSize = 22.sp,
                         color = DialogTextColor
                     )
 
@@ -3528,7 +3707,7 @@ fun ScoreboardScreen(
                             Row(modifier = Modifier.fillMaxWidth()) {
                                 Text(
                                     text = player,
-                                    fontSize = 16.sp,
+                                    fontSize = 22.sp,
                                     fontWeight = if (role != null) FontWeight.SemiBold else FontWeight.Normal
                                 )
                                 Spacer(modifier = Modifier.weight(1f))
@@ -3547,7 +3726,7 @@ fun ScoreboardScreen(
                     enabled = tempScorer != null,
                     colors = dialogButtonColors()
                 ) {
-                    Text("OK", fontSize = 16.sp)
+                    Text("OK", fontSize = 22.sp)
                 }
             },
             dismissButton = {
@@ -3555,7 +3734,7 @@ fun ScoreboardScreen(
                     onClick = { resetGoalInput() },
                     colors = dialogButtonColors()
                 ) {
-                    Text("Отмена", fontSize = 16.sp)
+                    Text("Отмена", fontSize = 22.sp)
                 }
             },
             containerColor = DialogBackground,
@@ -3719,6 +3898,11 @@ fun ScoreboardScreen(
                         // 2. Сразу же сформировать НОВЫЙ JSON и отправить как активную игру
                         // (buildGameJson установит новый gameStartMillis и сделает файл для текущего сезона)
                         notifyGameJsonUpdated(isFinal = false)
+                        // 2a. Перевести физическое табло из режима часов в режим хоккейного табло
+// (3× «выход» по ТЗ)
+                        scope.launch {
+                            espController.switchToScoreboardMode()
+                        }
 
                         // 3. Закрыть диалог и дать знать наружу (если MainActivity что-то делает дополнительно)
                         showNewGameConfirm = false

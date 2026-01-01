@@ -86,7 +86,6 @@ fun ScoreboardContentView(
                 modifier = Modifier.weight(1f),
                 onClick = { onTeamClick(rightClickTeam) }
             )
-
         }
 
         Spacer(modifier = Modifier.height(16.dp))
@@ -148,7 +147,7 @@ fun ScoreboardContentView(
                         Spacer(modifier = Modifier.width(4.dp))
                         Text(
                             text = teamName,
-                            fontSize = 14.sp,
+                            fontSize = 18.sp,
                             fontWeight = FontWeight.SemiBold,
                             color = teamColor
                         )
@@ -156,7 +155,7 @@ fun ScoreboardContentView(
                     Spacer(modifier = Modifier.height(2.dp))
                     Text(
                         text = formatGoalText(goal),
-                        fontSize = 14.sp,
+                        fontSize = 18.sp,
                         color = Color(0xFF81D4FA),
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
