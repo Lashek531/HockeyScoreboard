@@ -474,6 +474,12 @@ fun ScoreboardScreen(
         EspTabloController(context.applicationContext)
     }
     val espStatus by espController.status.collectAsState()
+    DisposableEffect(Unit) {
+        espController.startHealthMonitor()
+        onDispose {
+            espController.stopHealthMonitor()
+        }
+    }
 
     val nearbyWifiPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestPermission(),
