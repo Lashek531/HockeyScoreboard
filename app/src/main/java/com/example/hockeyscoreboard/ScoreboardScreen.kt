@@ -1950,19 +1950,28 @@ fun ScoreboardScreen(
                             modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically
                         ) {
-                            Column(modifier = Modifier.weight(1f)) {
+                            Column(
+                                modifier = Modifier.weight(1f),
+                                horizontalAlignment = Alignment.CenterHorizontally
+                            ) {
                                 Text(
                                     text = shiftTimerPhaseText,
                                     style = MaterialTheme.typography.bodyMedium,
-                                    color = Color(0xFFB0BEC5)
+                                    color = Color(0xFFB0BEC5),
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth()
                                 )
                                 Text(
                                     text = shiftTimerText,
                                     style = MaterialTheme.typography.headlineMedium,
                                     fontWeight = FontWeight.Bold,
-                                    color = Color(0xFFECEFF1)
+                                    color = Color(0xFFECEFF1),
+                                    fontSize = 100.sp,
+                                    textAlign = TextAlign.Center,
+                                    modifier = Modifier.fillMaxWidth()
                                 )
                             }
+
 
                             Spacer(modifier = Modifier.width(12.dp))
 
