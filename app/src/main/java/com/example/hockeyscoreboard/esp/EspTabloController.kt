@@ -60,6 +60,8 @@ class EspTabloController(
 
     private var discoveryListener: NsdManager.DiscoveryListener? = null
     private var resolveInProgress = false
+    private val resolveLock = Any()
+
 
     // Очередь команд: строго 1 активная команда
     private val sendMutex = Mutex()
@@ -110,9 +112,10 @@ class EspTabloController(
             Pair(code == 200, rtt)
         } catch (t: Throwable) {
             val rtt = System.currentTimeMillis() - start
-            logLine("PING EX ${t.javaClass.simpleName} rtt=${rtt}ms url=$url")
+            logLine("PING EX ${t.javaClass.simpleName} msg=${t.message} rtt=${rtt}ms url=$url")
             Pair(false, rtt)
         }
+
     }
 
     /**
@@ -147,9 +150,10 @@ class EspTabloController(
                         // Если несколько подряд — считаем, что ESP отвалилась, и запускаем переобнаружение
                         if (consecutivePingFails >= 3) {
                             _status.value = "ESP: ping fail (re-discovery)"
-                            _endpoint.value = null
+                            // endpoint НЕ сбрасываем: UDP может продолжать работать даже если HTTP недоступен
                             withContext(Dispatchers.Main) { startDiscovery() }
                         }
+
                     }
                 }
 
@@ -188,8 +192,11 @@ class EspTabloController(
 
             override fun onServiceFound(serviceInfo: NsdServiceInfo) {
                 if (serviceInfo.serviceType != SERVICE_TYPE) return
-                if (resolveInProgress) return
-                resolveInProgress = true
+
+                synchronized(resolveLock) {
+                    if (resolveInProgress) return
+                    resolveInProgress = true
+                }
 
                 logLine("DISCOVERY found name=${serviceInfo.serviceName}")
 
@@ -197,13 +204,15 @@ class EspTabloController(
                     serviceInfo,
                     object : NsdManager.ResolveListener {
                         override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                            resolveInProgress = false
+                            synchronized(resolveLock) { resolveInProgress = false }
+
                             logLine("DISCOVERY resolve FAILED code=$errorCode name=${serviceInfo.serviceName}")
                             _status.value = "ESP: resolve ошибка ($errorCode)"
                         }
 
                         override fun onServiceResolved(resolved: NsdServiceInfo) {
-                            resolveInProgress = false
+                            synchronized(resolveLock) { resolveInProgress = false }
+
                             val host = resolved.host ?: run {
                                 _status.value = "ESP: resolve без host"
                                 logLine("DISCOVERY resolve NO_HOST name=${resolved.serviceName}")
