@@ -105,6 +105,10 @@ import android.os.VibratorManager
 import androidx.compose.ui.platform.LocalContext
 import android.os.SystemClock
 import kotlinx.coroutines.delay
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.rememberSaveable
 
 
 
@@ -156,6 +160,8 @@ data class ActiveGameSnapshot(
     // Нужен для корректной синхронизации счёта при добавлении/удалении гола и при смене сторон между таймами.
     val tabloLeftTeam: Team
 )
+
+
 
 private enum class ShiftTimerPhase { SHIFT, BREAK }
 
@@ -329,6 +335,10 @@ private val DialogBackground = Color(0xFF10202B)
 private val DialogTitleColor = Color(0xFFECEFF1)
 private val DialogTextColor = Color(0xFFCFD8DC)
 
+private const val ESP_LOG_REFRESH_MS = 500L
+private const val ESP_LOG_TITLE = "Последние сообщения"
+
+
 // Единые цвета для текста кнопок диалогов
 @Composable
 private fun dialogButtonColors() = ButtonDefaults.textButtonColors(
@@ -368,7 +378,6 @@ fun ScoreboardScreen(
     var serverUrl by remember { mutableStateOf("") }
     var apiKey by remember { mutableStateOf("") }
     var telegramBotToken by remember { mutableStateOf("") }
-    var telegramChatId by remember { mutableStateOf("") }
     var telegramBotChatId by remember { mutableStateOf("") }
     var remoteTabIndex by rememberSaveable { mutableStateOf(0) } // 0=Fast, 1=Full
 
@@ -378,7 +387,6 @@ fun ScoreboardScreen(
     var initialServerUrl by remember { mutableStateOf("") }
     var initialApiKey by remember { mutableStateOf("") }
     var initialTelegramBotToken by remember { mutableStateOf("") }
-    var initialTelegramChatId by remember { mutableStateOf("") }
     var initialTelegramBotChatId by remember { mutableStateOf("") }
 
     // Диалог подтверждения изменения настроек
@@ -534,6 +542,10 @@ fun ScoreboardScreen(
     var manualSendChatId by remember { mutableStateOf("") }
     var manualSendEventId by remember { mutableStateOf("") }
     var manualExportSending by remember { mutableStateOf(false) }
+    var showEspLogDialog by remember { mutableStateOf(false) }
+    var espLogText by remember { mutableStateOf("") }
+
+
 
 
 
@@ -592,9 +604,27 @@ fun ScoreboardScreen(
     val shiftDurationMs = 2 * 60 * 1000L
     val breakDurationMs = 12 * 1000L
 
-    var shiftTimerRunning by remember { mutableStateOf(false) }
-    var shiftTimerPhase by remember { mutableStateOf(ShiftTimerPhase.SHIFT) }
-    var shiftTimerRemainingMs by remember { mutableStateOf(shiftDurationMs) }
+// Saver для enum, чтобы rememberSaveable мог его сохранять
+    val shiftTimerPhaseSaver = remember {
+        Saver<ShiftTimerPhase, String>(
+            save = { phase: ShiftTimerPhase -> phase.name },
+            restore = { saved: String -> ShiftTimerPhase.valueOf(saved) }
+        )
+    }
+
+
+    var shiftTimerRunning by rememberSaveable { mutableStateOf(false) }
+
+    var shiftTimerPhase by rememberSaveable(stateSaver = shiftTimerPhaseSaver) {
+        mutableStateOf(ShiftTimerPhase.SHIFT)
+    }
+
+    var shiftTimerRemainingMs by rememberSaveable { mutableStateOf(shiftDurationMs) }
+
+// Абсолютное “время окончания” по elapsedRealtime (нужно для переживания поворота)
+    var shiftTimerEndElapsedMs by rememberSaveable { mutableStateOf<Long?>(null) }
+
+
 
     fun formatMmSs(ms: Long): String {
         val totalSec = (ms / 1000L).toInt()
@@ -636,8 +666,9 @@ fun ScoreboardScreen(
     val onShiftTimerStart: () -> Unit = {
         if (!gameFinished && !shiftTimerRunning) {
             shiftTimerRunning = true
+            shiftTimerEndElapsedMs = SystemClock.elapsedRealtime() + shiftTimerRemainingMs
 
-            // Запуск смены "с нуля" -> синхронизируем внешнее табло и даём стартовый гудок
+            // “Старт смены с нуля” — синхронизируем внешнее табло и даём стартовый сигнал
             if (shiftTimerPhase == ShiftTimerPhase.SHIFT && shiftTimerRemainingMs == shiftDurationMs) {
                 sendExternalShiftStartSignals()
                 sendSirenShiftStart()
@@ -650,7 +681,13 @@ fun ScoreboardScreen(
 
     val onShiftTimerPause: () -> Unit = {
         if (!gameFinished && shiftTimerRunning) {
+            val end = shiftTimerEndElapsedMs
+            if (end != null) {
+                shiftTimerRemainingMs = (end - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+            }
+
             shiftTimerRunning = false
+            shiftTimerEndElapsedMs = null
             scope.launch { espController.press("9") } // STOP
         }
     }
@@ -660,8 +697,8 @@ fun ScoreboardScreen(
             shiftTimerRunning = false
             shiftTimerPhase = ShiftTimerPhase.SHIFT
             shiftTimerRemainingMs = shiftDurationMs
+            shiftTimerEndElapsedMs = null
 
-            // STOP + RESET (без START)
             scope.launch {
                 espController.press("9")
                 espController.sendPresses("8", 3)
@@ -669,49 +706,54 @@ fun ScoreboardScreen(
         }
     }
 
+
 // Авто-остановка таймера при завершении игры
     LaunchedEffect(gameFinished) {
-        if (gameFinished) shiftTimerRunning = false
+        if (gameFinished) {
+            shiftTimerRunning = false
+            shiftTimerEndElapsedMs = null
+        }
     }
 
-// Основной тик таймера
-    LaunchedEffect(shiftTimerRunning, shiftTimerPhase, gameFinished) {
-        if (!shiftTimerRunning || gameFinished) return@LaunchedEffect
 
-        var lastTs = SystemClock.elapsedRealtime()
+
+    LaunchedEffect(shiftTimerRunning, shiftTimerPhase, gameFinished, shiftTimerEndElapsedMs) {
+        if (gameFinished || !shiftTimerRunning) return@LaunchedEffect
+
         while (shiftTimerRunning && !gameFinished) {
             delay(100)
 
-            val nowTs = SystemClock.elapsedRealtime()
-            val dt = nowTs - lastTs
-            lastTs = nowTs
-
-            val newRemaining = shiftTimerRemainingMs - dt
-            if (newRemaining > 0) {
-                shiftTimerRemainingMs = newRemaining
-                continue
-            }
-
-            if (shiftTimerPhase == ShiftTimerPhase.SHIFT) {
-                // Конец смены -> длинный гудок -> перерыв 12 сек (без звука на старте перерыва)
-                sendSirenShiftEnd()
-                shiftTimerPhase = ShiftTimerPhase.BREAK
-                shiftTimerRemainingMs = breakDurationMs
+            val end = shiftTimerEndElapsedMs
+            if (end == null) {
+                shiftTimerRunning = false
             } else {
-                // Конец перерыва -> новая смена 2:00 -> STOP/RESET/START + двойной гудок
-                shiftTimerPhase = ShiftTimerPhase.SHIFT
-                shiftTimerRemainingMs = shiftDurationMs
-                sendExternalShiftStartSignals()
-                sendSirenShiftStart()
+                val now = SystemClock.elapsedRealtime()
+                val remaining = (end - now).coerceAtLeast(0L)
+                shiftTimerRemainingMs = remaining
+
+                if (remaining == 0L) {
+                    if (shiftTimerPhase == ShiftTimerPhase.SHIFT) {
+                        sendSirenShiftEnd()
+                        shiftTimerPhase = ShiftTimerPhase.BREAK
+                        shiftTimerRemainingMs = breakDurationMs
+                        shiftTimerEndElapsedMs = SystemClock.elapsedRealtime() + breakDurationMs
+                    } else {
+                        shiftTimerPhase = ShiftTimerPhase.SHIFT
+                        shiftTimerRemainingMs = shiftDurationMs
+                        shiftTimerEndElapsedMs = SystemClock.elapsedRealtime() + shiftDurationMs
+                        sendExternalShiftStartSignals()
+                        sendSirenShiftStart()
+                    }
+                }
             }
         }
     }
+
 
     LaunchedEffect(Unit) {
         serverUrl = settingsRepository.getServerUrl()
         apiKey = settingsRepository.getApiKey()
         telegramBotToken = (settingsRepository as SettingsRepositoryImpl).getTelegramBotToken()
-        telegramChatId = (settingsRepository as SettingsRepositoryImpl).getTelegramChatId()
         telegramBotChatId = (settingsRepository as SettingsRepositoryImpl).getTelegramBotChatId()
 
         // При первом запуске можно сразу считать эти значения как "исходные"
@@ -719,7 +761,6 @@ fun ScoreboardScreen(
         initialServerUrl = serverUrl
         initialApiKey = apiKey
         initialTelegramBotToken = telegramBotToken
-        initialTelegramChatId = telegramChatId
         initialTelegramBotChatId = telegramBotChatId
     }
 
@@ -1037,8 +1078,6 @@ fun ScoreboardScreen(
 
             // Telegram-настройки
             put("telegramBotToken", telegramBotToken.trim())
-            // PokeChat — хоккейный чат
-            put("telegramHockeyChatId", telegramChatId.trim())
             // ExternalBot — чат бота
             put("telegramBotChatId", telegramBotChatId.trim())
         }
@@ -1054,7 +1093,6 @@ fun ScoreboardScreen(
             (settingsRepository as SettingsRepositoryImpl).setServerUrl(serverUrl)
             (settingsRepository as SettingsRepositoryImpl).setApiKey(apiKey)
             (settingsRepository as SettingsRepositoryImpl).setTelegramBotToken(telegramBotToken)
-            (settingsRepository as SettingsRepositoryImpl).setTelegramChatId(telegramChatId)
             (settingsRepository as SettingsRepositoryImpl).setTelegramBotChatId(telegramBotChatId)
 
             // 2. Формируем JSON настроек
@@ -1090,7 +1128,6 @@ fun ScoreboardScreen(
         serverUrl = initialServerUrl
         apiKey = initialApiKey
         telegramBotToken = initialTelegramBotToken
-        telegramChatId = initialTelegramChatId
         telegramBotChatId = initialTelegramBotChatId
 
         showSettingsConfirmDialog = false
@@ -1427,7 +1464,6 @@ fun ScoreboardScreen(
             val apiKeyFromServer = root.optString("apiKey", "").trim()
 
             val tokenFromServer = root.optString("telegramBotToken", "").trim()
-            val hockeyChatFromServer = root.optString("telegramHockeyChatId", "").trim()
             val botChatFromServer = root.optString("telegramBotChatId", "").trim()
 
             // 2. Репозиторий настроек
@@ -1445,11 +1481,6 @@ fun ScoreboardScreen(
             if (tokenFromServer.isNotEmpty()) {
                 impl.setTelegramBotToken(tokenFromServer)
                 telegramBotToken = tokenFromServer
-            }
-
-            if (hockeyChatFromServer.isNotEmpty()) {
-                impl.setTelegramChatId(hockeyChatFromServer)
-                telegramChatId = hockeyChatFromServer
             }
 
             if (botChatFromServer.isNotEmpty()) {
@@ -2150,7 +2181,6 @@ fun ScoreboardScreen(
                             initialServerUrl = serverUrl
                             initialApiKey = apiKey
                             initialTelegramBotToken = telegramBotToken
-                            initialTelegramChatId = telegramChatId
                             initialTelegramBotChatId = telegramBotChatId
 
                             showSettingsDialog = true
@@ -2834,6 +2864,66 @@ fun ScoreboardScreen(
         )
     }
 
+    if (showEspLogDialog) {
+
+        LaunchedEffect(showEspLogDialog) {
+            while (showEspLogDialog) {
+                val lines = espController.readLogLinesNewestFirst()
+                espLogText = if (lines.isEmpty()) "Лог пуст" else lines.joinToString("\n")
+                delay(500L)
+            }
+        }
+
+        AlertDialog(
+            onDismissRequest = { showEspLogDialog = false },
+            title = { Text("Лог связи с табло (ESP)", fontSize = 20.sp) },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 200.dp, max = 520.dp)
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        text = "Последние сообщения",
+                        color = DialogTitleColor,
+                        fontSize = 16.sp,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Spacer(modifier = Modifier.height(8.dp))
+                    Text(
+                        text = espLogText,
+                        color = DialogTextColor,
+                        fontSize = 16.sp // +4
+                    )
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        scope.launch {
+                            val lines = espController.readLogLinesNewestFirst()
+                            espLogText = if (lines.isEmpty()) "Лог пуст" else lines.joinToString("\n")
+                        }
+                    },
+                    colors = dialogButtonColors()
+                ) { Text("Обновить", fontSize = 16.sp) }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { showEspLogDialog = false },
+                    colors = dialogButtonColors()
+                ) { Text("Закрыть", fontSize = 16.sp) }
+            },
+            containerColor = DialogBackground,
+            titleContentColor = DialogTitleColor,
+            textContentColor = DialogTextColor
+        )
+    }
+
+
+
+
     // --- ДИАЛОГ: НАСТРОЙКИ ---
 
     if (showSettingsDialog) {
@@ -2937,24 +3027,6 @@ fun ScoreboardScreen(
                         )
                     )
 
-                    // Hockey Chat ID
-                    OutlinedTextField(
-                        value = telegramChatId,
-                        onValueChange = { telegramChatId = it },
-                        label = { Text("Hockey Chat ID") },
-                        singleLine = true,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(bottom = 8.dp),
-                        colors = OutlinedTextFieldDefaults.colors(
-                            focusedTextColor = DialogTitleColor,
-                            unfocusedTextColor = DialogTitleColor,
-                            cursorColor = DialogTitleColor,
-                            focusedBorderColor = Color(0xFF546E7A),
-                            unfocusedBorderColor = Color(0xFF455A64)
-                        )
-                    )
-
                     // --- Кнопки под полями (как в ScoreboardScreenOld) ---
                     TextButton(
                         onClick = {
@@ -3010,8 +3082,25 @@ fun ScoreboardScreen(
                     ) {
                         Text("Базовый список игроков", fontSize = 16.sp)
                     }
+                    TextButton(
+                        onClick = {
+                            scope.launch {
+                                val path = espController.getLogFilePath()
+                                val file = File(path)
+                                espLogText = withContext(Dispatchers.IO) {
+                                    if (file.exists()) file.readText(Charsets.UTF_8) else "Файл не найден:\n$path"
+                                }
+                                showEspLogDialog = true
+                            }
+                        },
+                        colors = dialogButtonColors()
+                    ) {
+                        Text("Просмотр лога связи", fontSize = 16.sp)
+                    }
+
                 }
             },
+
 
             // ОКЕЙ: если были изменения -> открыть confirm-dialog, иначе просто закрыть
             confirmButton = {
@@ -3022,7 +3111,6 @@ fun ScoreboardScreen(
                                     serverUrl != initialServerUrl ||
                                     apiKey != initialApiKey ||
                                     telegramBotToken != initialTelegramBotToken ||
-                                    telegramChatId != initialTelegramChatId ||
                                     telegramBotChatId != initialTelegramBotChatId
 
                         if (changed) {

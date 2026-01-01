@@ -19,9 +19,7 @@ import org.json.JSONObject
 import java.io.File
 import java.net.DatagramPacket
 import java.net.DatagramSocket
-import java.net.HttpURLConnection
 import java.net.InetAddress
-import java.net.URL
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -37,9 +35,16 @@ class EspTabloController(
         private const val SERVICE_TYPE = "_hockeytablo._udp."
         private const val DEFAULT_PORT = 4210
 
-        private const val ACK_TIMEOUT_MS = 250
+        private const val ACK_TIMEOUT_MS = 500
         private const val RETRIES = 3
         private const val RETRY_DELAY_MS = 120L
+        private const val MAX_LOG_LINES = 5000
+        private const val TRIM_EVERY_N_LINES = 100
+        private const val TRIM_MIN_INTERVAL_MS = 30_000L
+        private const val PINGPONG_TIMEOUT_MS = 1500
+        private const val PINGPONG_FAILS_TO_REDISCOVER = 5
+        private const val PINGPONG_INTERVAL_MS = 5000L
+
     }
 
     private val appCtx: Context = appContext.applicationContext
@@ -76,15 +81,50 @@ class EspTabloController(
     }
 
     private val logTsFmt = SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS", Locale.US)
+    private var logLinesSinceTrim = 0
+    private var lastTrimAtMs = 0L
+
+    private fun trimLogFileIfNeeded(nowMs: Long) {
+        runCatching {
+            if (!logFile.exists()) return
+            val lines = logFile.readLines(Charsets.UTF_8)
+            if (lines.size <= MAX_LOG_LINES) return
+
+            val tail = lines.takeLast(MAX_LOG_LINES).joinToString(separator = "\n") + "\n"
+            logFile.writeText(tail, Charsets.UTF_8)
+        }.onSuccess {
+            lastTrimAtMs = nowMs
+        }
+    }
+
+
 
     private fun logLine(message: String) {
         runCatching {
             val ts = logTsFmt.format(Date())
             logFile.appendText("$ts  $message\n", Charsets.UTF_8)
+
+            logLinesSinceTrim++
+
+            val nowMs = System.currentTimeMillis()
+            val canTrimByCount = logLinesSinceTrim >= TRIM_EVERY_N_LINES
+            val canTrimByTime = (nowMs - lastTrimAtMs) >= TRIM_MIN_INTERVAL_MS
+
+            if (canTrimByCount && canTrimByTime) {
+                logLinesSinceTrim = 0
+                trimLogFileIfNeeded(nowMs)
+            }
         }
     }
 
+
+
     fun getLogFilePath(): String = logFile.absolutePath
+    suspend fun readLogLinesNewestFirst(): List<String> = withContext(Dispatchers.IO) {
+        if (!logFile.exists()) return@withContext emptyList()
+        // Берём все строки и разворачиваем: последние сверху
+        logFile.readLines(Charsets.UTF_8).asReversed()
+    }
 
     // -------------------- HEALTH MONITOR (HTTP /ping) --------------------
 
@@ -93,30 +133,38 @@ class EspTabloController(
     private var consecutivePingFails: Int = 0
 
     /**
-     * HTTP ping: GET http://<esp-ip>/ping
-     * Ожидаем HTTP 200. Тело читать не обязательно.
+     * Ping/Pong без JSON:
+     * send: "PING"
+     * recv: "PONG"
+     *
+     * Минимальная нагрузка на ESP и на Android.
      */
-    private suspend fun httpPingOnce(ep: EspEndpoint): Pair<Boolean, Long> = withContext(Dispatchers.IO) {
-        val url = URL("http://${ep.host.hostAddress}/ping")
-        val start = System.currentTimeMillis()
-        try {
-            val conn = (url.openConnection() as HttpURLConnection).apply {
-                connectTimeout = 1500
-                readTimeout = 1500
-                requestMethod = "GET"
-            }
-            conn.connect()
-            val code = conn.responseCode
-            conn.disconnect()
-            val rtt = System.currentTimeMillis() - start
-            Pair(code == 200, rtt)
-        } catch (t: Throwable) {
-            val rtt = System.currentTimeMillis() - start
-            logLine("PING EX ${t.javaClass.simpleName} msg=${t.message} rtt=${rtt}ms url=$url")
-            Pair(false, rtt)
-        }
+    private suspend fun pingPongOnce(ep: EspEndpoint): Pair<Boolean, Long> = withContext(Dispatchers.IO) {
+        val data = "PING".toByteArray(Charsets.UTF_8)
 
+        DatagramSocket().use { socket ->
+            socket.soTimeout = PINGPONG_TIMEOUT_MS
+            val start = System.currentTimeMillis()
+            try {
+                val out = DatagramPacket(data, data.size, ep.host, ep.port)
+                socket.send(out)
+
+                val buf = ByteArray(32)
+                val inp = DatagramPacket(buf, buf.size)
+                socket.receive(inp)
+
+                val rtt = System.currentTimeMillis() - start
+                val resp = String(inp.data, 0, inp.length, Charsets.UTF_8).trim()
+
+                Pair(resp == "PONG", rtt)
+            } catch (t: Throwable) {
+                val rtt = System.currentTimeMillis() - start
+                logLine("PING EX ${t.javaClass.simpleName} msg=${t.message} rtt=${rtt}ms ep=${ep.host.hostAddress}:${ep.port}")
+                Pair(false, rtt)
+            }
+        }
     }
+
 
     /**
      * Запускаем мониторинг доступности ESP по HTTP /ping каждые 5 секунд.
@@ -139,7 +187,7 @@ class EspTabloController(
                     }
                 }
  else {
-                    val (ok, rtt) = httpPingOnce(ep)
+                    val (ok, rtt) = pingPongOnce(ep)
                     if (ok) {
                         consecutivePingFails = 0
                         logLine("PING ok rtt=${rtt}ms ep=${ep.host.hostAddress}:${ep.port}")
@@ -148,7 +196,7 @@ class EspTabloController(
                         logLine("PING FAIL #$consecutivePingFails rtt=${rtt}ms ep=${ep.host.hostAddress}:${ep.port}")
 
                         // Если несколько подряд — считаем, что ESP отвалилась, и запускаем переобнаружение
-                        if (consecutivePingFails >= 3) {
+                        if (consecutivePingFails >= PINGPONG_FAILS_TO_REDISCOVER) {
                             _status.value = "ESP: ping fail (re-discovery)"
                             // endpoint НЕ сбрасываем: UDP может продолжать работать даже если HTTP недоступен
                             withContext(Dispatchers.Main) { startDiscovery() }
@@ -157,7 +205,8 @@ class EspTabloController(
                     }
                 }
 
-                delay(5000L)
+                delay(PINGPONG_INTERVAL_MS)
+
             }
         }
     }
