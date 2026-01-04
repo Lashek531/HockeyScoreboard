@@ -1206,6 +1206,8 @@ fun ScoreboardScreen(
 
 
 
+
+
         showSettingsConfirmDialog = false
         showSettingsDialog = false
     }
