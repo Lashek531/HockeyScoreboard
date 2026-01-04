@@ -379,7 +379,15 @@ fun ScoreboardScreen(
     var apiKey by remember { mutableStateOf("") }
     var telegramBotToken by remember { mutableStateOf("") }
     var telegramBotChatId by remember { mutableStateOf("") }
+
+// Длительности таймера (из интерфейса)
+    var shiftDurationMsSetting by remember { mutableStateOf(DEFAULT_SHIFT_DURATION_MS) }
+    var breakDurationMsSetting by remember { mutableStateOf(DEFAULT_BREAK_DURATION_MS) }
+    var shiftDurationSecText by remember { mutableStateOf("") }
+    var breakDurationSecText by remember { mutableStateOf("") }
+
     var remoteTabIndex by rememberSaveable { mutableStateOf(0) } // 0=Fast, 1=Full
+
 
 
     // Снапшот значений настроек на момент открытия диалога
@@ -600,9 +608,9 @@ fun ScoreboardScreen(
 
     var gameFinished by rememberSaveable { mutableStateOf(false) }
 
-    // ===================== ТАЙМЕР СМЕН (2:00 + 0:12) =====================
-    val shiftDurationMs = 2 * 60 * 1000L
-    val breakDurationMs = 12 * 1000L
+// ===================== ТАЙМЕР СМЕН (SHIFT + BREAK) =====================
+// shiftDurationMsSetting / breakDurationMsSetting приходят из настроек (UI)
+
 
 // Saver для enum, чтобы rememberSaveable мог его сохранять
     val shiftTimerPhaseSaver = remember {
@@ -619,19 +627,31 @@ fun ScoreboardScreen(
         mutableStateOf(ShiftTimerPhase.SHIFT)
     }
 
-    var shiftTimerRemainingMs by rememberSaveable { mutableStateOf(shiftDurationMs) }
+    var shiftTimerRemainingMs by rememberSaveable { mutableStateOf(shiftDurationMsSetting) }
+
 
 // Абсолютное “время окончания” по elapsedRealtime (нужно для переживания поворота)
     var shiftTimerEndElapsedMs by rememberSaveable { mutableStateOf<Long?>(null) }
+// Планируемый момент старта отсчёта на планшете (для компенсации задержки табло)
+    var shiftTimerPlannedStartElapsedMs by rememberSaveable { mutableStateOf<Long?>(null) }
+
+// Снапшот remaining на момент нажатия Start/Resume (чтобы "держать 02:00" во время ожидания)
+    var shiftTimerStartRemainingMs by rememberSaveable { mutableStateOf<Long?>(null) }
 
 
 
     fun formatMmSs(ms: Long): String {
-        val totalSec = (ms / 1000L).toInt()
-        val mm = totalSec / 60
-        val ss = totalSec % 60
+        val totalSec = if (ms <= 0L) {
+            0L
+        } else {
+            (ms + 999L) / 1000L // ceil(ms/1000) — убирает "01:59 сразу"
+        }
+
+        val mm = totalSec / 60L
+        val ss = totalSec % 60L
         return "%02d:%02d".format(mm, ss)
     }
+
 
     val shiftTimerPhaseText = if (shiftTimerPhase == ShiftTimerPhase.SHIFT) "Смена" else "Перерыв"
     val shiftTimerText = formatMmSs(shiftTimerRemainingMs)
@@ -648,64 +668,89 @@ fun ScoreboardScreen(
     fun sendSirenShiftStart() {
         scope.launch {
             espController.sendSiren(
-                onMs = listOf(300, 300),
-                offMs = listOf(500, 0)
+                onMs = SIREN_SHIFT_START_ON_MS,
+                offMs = SIREN_SHIFT_START_OFF_MS
             )
         }
     }
+
 
     fun sendSirenShiftEnd() {
         scope.launch {
             espController.sendSiren(
-                onMs = listOf(1000),
-                offMs = listOf(0)
+                onMs = SIREN_SHIFT_END_ON_MS,
+                offMs = SIREN_SHIFT_END_OFF_MS
             )
         }
     }
 
+
     val onShiftTimerStart: () -> Unit = {
         if (!gameFinished && !shiftTimerRunning) {
             shiftTimerRunning = true
-            shiftTimerEndElapsedMs = SystemClock.elapsedRealtime() + shiftTimerRemainingMs
 
-            // “Старт смены с нуля” — синхронизируем внешнее табло и даём стартовый сигнал
-            if (shiftTimerPhase == ShiftTimerPhase.SHIFT && shiftTimerRemainingMs == shiftDurationMs) {
-                sendExternalShiftStartSignals()
-                sendSirenShiftStart()
-            } else if (shiftTimerPhase == ShiftTimerPhase.SHIFT) {
-                // Resume во время смены — просто START
-                scope.launch { espController.press("-") }
+            val now = SystemClock.elapsedRealtime()
+
+            if (shiftTimerPhase == ShiftTimerPhase.SHIFT) {
+                // Для смены (и Start с нуля, и Resume) применяем компенсацию задержки табло
+                val plannedStart = now + EXTERNAL_START_DELAY_MS
+                shiftTimerPlannedStartElapsedMs = plannedStart
+                shiftTimerStartRemainingMs = shiftTimerRemainingMs
+                shiftTimerEndElapsedMs = plannedStart + shiftTimerRemainingMs
+
+                // “Старт смены с нуля” — STOP -> RESET -> START + сирена
+                if (shiftTimerRemainingMs == shiftDurationMsSetting) {
+                    sendExternalShiftStartSignals()
+                    sendSirenShiftStart()
+                } else {
+                    // Resume во время смены — просто START
+                    scope.launch { espController.press("-") }
+                }
+            } else {
+                // Перерыв не синхронизируем с табло
+                shiftTimerPlannedStartElapsedMs = null
+                shiftTimerStartRemainingMs = null
+                shiftTimerEndElapsedMs = now + shiftTimerRemainingMs
             }
         }
     }
 
+
     val onShiftTimerPause: () -> Unit = {
         if (!gameFinished && shiftTimerRunning) {
+            val now = SystemClock.elapsedRealtime()
             val end = shiftTimerEndElapsedMs
+            val planned = shiftTimerPlannedStartElapsedMs
+            val snap = shiftTimerStartRemainingMs
+
             if (end != null) {
-                shiftTimerRemainingMs = (end - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                shiftTimerRemainingMs = if (planned != null && now < planned && snap != null) {
+                    snap // во время ожидания держим исходное (например 02:00)
+                } else {
+                    (end - now).coerceAtLeast(0L)
+                }
             }
 
             shiftTimerRunning = false
             shiftTimerEndElapsedMs = null
+            shiftTimerPlannedStartElapsedMs = null
+            shiftTimerStartRemainingMs = null
+
             scope.launch { espController.press("9") } // STOP
         }
     }
+
 
     val onShiftTimerReset: () -> Unit = {
         if (!gameFinished) {
             shiftTimerRunning = false
             shiftTimerPhase = ShiftTimerPhase.SHIFT
-            shiftTimerRemainingMs = shiftDurationMs
+            shiftTimerRemainingMs = shiftDurationMsSetting
             shiftTimerEndElapsedMs = null
-
-            scope.launch {
-                espController.press("9")
-                espController.sendPresses("8", 3)
-            }
+            shiftTimerPlannedStartElapsedMs = null
+            shiftTimerStartRemainingMs = null
         }
     }
-
 
 // Авто-остановка таймера при завершении игры
     LaunchedEffect(gameFinished) {
@@ -721,30 +766,60 @@ fun ScoreboardScreen(
         if (gameFinished || !shiftTimerRunning) return@LaunchedEffect
 
         while (shiftTimerRunning && !gameFinished) {
-            delay(100)
+            delay(TIMER_TICK_MS)
 
             val end = shiftTimerEndElapsedMs
             if (end == null) {
                 shiftTimerRunning = false
             } else {
                 val now = SystemClock.elapsedRealtime()
+
+                val planned = shiftTimerPlannedStartElapsedMs
+                val snap = shiftTimerStartRemainingMs
+
+                // Пока ждём старт табло — не уменьшаем, держим стартовое значение
+                if (planned != null && now < planned && snap != null) {
+                    shiftTimerRemainingMs = snap
+                    continue
+                } else if (planned != null && now >= planned) {
+                    // Старт наступил — больше не нужен planned/snap
+                    shiftTimerPlannedStartElapsedMs = null
+                    shiftTimerStartRemainingMs = null
+                }
+
                 val remaining = (end - now).coerceAtLeast(0L)
                 shiftTimerRemainingMs = remaining
 
+
                 if (remaining == 0L) {
+                    val now2 = SystemClock.elapsedRealtime()
+
                     if (shiftTimerPhase == ShiftTimerPhase.SHIFT) {
+                        // Конец смены -> перерыв (локально)
                         sendSirenShiftEnd()
                         shiftTimerPhase = ShiftTimerPhase.BREAK
-                        shiftTimerRemainingMs = breakDurationMs
-                        shiftTimerEndElapsedMs = SystemClock.elapsedRealtime() + breakDurationMs
+
+                        shiftTimerPlannedStartElapsedMs = null
+                        shiftTimerStartRemainingMs = null
+
+                        shiftTimerRemainingMs = breakDurationMsSetting
+                        shiftTimerEndElapsedMs = now2 + breakDurationMsSetting
                     } else {
+                        // Конец перерыва -> новая смена (запускаем табло + применяем компенсацию)
                         shiftTimerPhase = ShiftTimerPhase.SHIFT
-                        shiftTimerRemainingMs = shiftDurationMs
-                        shiftTimerEndElapsedMs = SystemClock.elapsedRealtime() + shiftDurationMs
+
+                        val plannedStart = now2 + EXTERNAL_START_DELAY_MS
+                        shiftTimerPlannedStartElapsedMs = plannedStart
+                        shiftTimerStartRemainingMs = shiftDurationMsSetting
+
+                        shiftTimerRemainingMs = shiftDurationMsSetting
+                        shiftTimerEndElapsedMs = plannedStart + shiftDurationMsSetting
+
                         sendExternalShiftStartSignals()
                         sendSirenShiftStart()
                     }
                 }
+
             }
         }
     }
@@ -755,6 +830,13 @@ fun ScoreboardScreen(
         apiKey = settingsRepository.getApiKey()
         telegramBotToken = (settingsRepository as SettingsRepositoryImpl).getTelegramBotToken()
         telegramBotChatId = (settingsRepository as SettingsRepositoryImpl).getTelegramBotChatId()
+
+        // Длительности таймера (из настроек)
+        shiftDurationMsSetting = (settingsRepository as SettingsRepositoryImpl).getShiftDurationMs()
+        breakDurationMsSetting = (settingsRepository as SettingsRepositoryImpl).getBreakDurationMs()
+        shiftDurationSecText = (shiftDurationMsSetting / 1000L).toString()
+        breakDurationSecText = (breakDurationMsSetting / 1000L).toString()
+
 
         // При первом запуске можно сразу считать эти значения как "исходные"
         initialSeason = currentSeason
@@ -1094,6 +1176,18 @@ fun ScoreboardScreen(
             (settingsRepository as SettingsRepositoryImpl).setApiKey(apiKey)
             (settingsRepository as SettingsRepositoryImpl).setTelegramBotToken(telegramBotToken)
             (settingsRepository as SettingsRepositoryImpl).setTelegramBotChatId(telegramBotChatId)
+            val newShiftSec = shiftDurationSecText.toLongOrNull()
+            val newBreakSec = breakDurationSecText.toLongOrNull()
+
+            if (newShiftSec != null && newShiftSec > 0L) {
+                shiftDurationMsSetting = newShiftSec * 1000L
+                (settingsRepository as SettingsRepositoryImpl).setShiftDurationMs(shiftDurationMsSetting)
+            }
+
+            if (newBreakSec != null && newBreakSec > 0L) {
+                breakDurationMsSetting = newBreakSec * 1000L
+                (settingsRepository as SettingsRepositoryImpl).setBreakDurationMs(breakDurationMsSetting)
+            }
 
             // 2. Формируем JSON настроек
             val json = buildAppSettingsJson()
@@ -2957,6 +3051,43 @@ fun ScoreboardScreen(
                             unfocusedBorderColor = Color(0xFF455A64)
                         )
                     )
+
+                    OutlinedTextField(
+                        value = shiftDurationSecText,
+                        onValueChange = { shiftDurationSecText = it.filter { ch -> ch.isDigit() } },
+                        label = { Text("Длительность смены (сек)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = DialogTitleColor,
+                            unfocusedTextColor = DialogTitleColor,
+                            cursorColor = DialogTitleColor,
+                            focusedBorderColor = Color(0xFF546E7A),
+                            unfocusedBorderColor = Color(0xFF455A64)
+                        )
+                    )
+
+                    OutlinedTextField(
+                        value = breakDurationSecText,
+                        onValueChange = { breakDurationSecText = it.filter { ch -> ch.isDigit() } },
+                        label = { Text("Длительность перерыва (сек)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = DialogTitleColor,
+                            unfocusedTextColor = DialogTitleColor,
+                            cursorColor = DialogTitleColor,
+                            focusedBorderColor = Color(0xFF546E7A),
+                            unfocusedBorderColor = Color(0xFF455A64)
+                        )
+                    )
+
 
                     OutlinedTextField(
                         value = serverUrl,
