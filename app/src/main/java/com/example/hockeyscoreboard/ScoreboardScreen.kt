@@ -379,6 +379,8 @@ fun ScoreboardScreen(
     var apiKey by remember { mutableStateOf("") }
     var telegramBotToken by remember { mutableStateOf("") }
     var telegramBotChatId by remember { mutableStateOf("") }
+    var espHost by remember { mutableStateOf("") } // IPv4 ESP (static)
+
 
 // Длительности таймера (из интерфейса)
     var shiftDurationMsSetting by remember { mutableStateOf(DEFAULT_SHIFT_DURATION_MS) }
@@ -396,6 +398,8 @@ fun ScoreboardScreen(
     var initialApiKey by remember { mutableStateOf("") }
     var initialTelegramBotToken by remember { mutableStateOf("") }
     var initialTelegramBotChatId by remember { mutableStateOf("") }
+    var initialEspHost by remember { mutableStateOf("") }
+
 
     // Диалог подтверждения изменения настроек
     var showSettingsConfirmDialog by remember { mutableStateOf(false) }
@@ -497,52 +501,6 @@ fun ScoreboardScreen(
             espController.stopDiscovery()
         }
     }
-
-
-    val nearbyWifiPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-        onResult = { granted ->
-            if (granted) {
-                espController.startDiscovery()
-            }
-            // если не дали — статус останется “не найдена/поиск…”, это ок для MVP
-        }
-    )
-
-    val locationPermissionLauncher = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.RequestPermission(),
-        onResult = { granted ->
-            if (granted) {
-                espController.startDiscovery()
-            }
-            // если не дали — ничего не делаем, диалог покажет текущий статус
-        }
-    )
-
-    // Если разрешение уже выдано ранее, запускаем discovery сразу при открытии экрана,
-    // чтобы синхронизация счёта (при добавлении/удалении гола) работала без обязательного открытия диалога.
-    LaunchedEffect(Unit) {
-        if (Build.VERSION.SDK_INT >= 33) {
-            val perm = Manifest.permission.NEARBY_WIFI_DEVICES
-            val hasPerm = ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
-            if (hasPerm) {
-                espController.startDiscovery()
-            } else {
-                nearbyWifiPermissionLauncher.launch(perm)
-            }
-        } else {
-            val perm = Manifest.permission.ACCESS_FINE_LOCATION
-            val hasPerm = ContextCompat.checkSelfPermission(context, perm) == PackageManager.PERMISSION_GRANTED
-            if (hasPerm) {
-                espController.startDiscovery()
-            } else {
-                locationPermissionLauncher.launch(perm)
-            }
-        }
-    }
-
-
-
 
     var showNoTeamsDialog by remember { mutableStateOf(false) }
     var showSettingsDialog by remember { mutableStateOf(false) }
@@ -659,8 +617,6 @@ fun ScoreboardScreen(
     // В начале каждой смены: STOP -> RESET -> START (как вы подтвердили)
     fun sendExternalShiftStartSignals() {
         scope.launch {
-            espController.press("9")            // STOP/PAUSE
-            espController.sendPresses("8", 3)   // RESET (x3)
             espController.press("-")            // START
         }
     }
@@ -668,21 +624,23 @@ fun ScoreboardScreen(
     fun sendSirenShiftStart() {
         scope.launch {
             espController.sendSiren(
-                onMs = SIREN_SHIFT_START_ON_MS,
-                offMs = SIREN_SHIFT_START_OFF_MS
+                onMs = SIREN_SHIFT_START_ON_MS.firstOrNull() ?: 0,
+                offMs = SIREN_SHIFT_START_OFF_MS.firstOrNull() ?: 0
             )
         }
     }
+
 
 
     fun sendSirenShiftEnd() {
         scope.launch {
             espController.sendSiren(
-                onMs = SIREN_SHIFT_END_ON_MS,
-                offMs = SIREN_SHIFT_END_OFF_MS
+                onMs = SIREN_SHIFT_END_ON_MS.firstOrNull() ?: 0,
+                offMs = SIREN_SHIFT_END_OFF_MS.firstOrNull() ?: 0
             )
         }
     }
+
 
 
     val onShiftTimerStart: () -> Unit = {
@@ -743,6 +701,10 @@ fun ScoreboardScreen(
 
     val onShiftTimerReset: () -> Unit = {
         if (!gameFinished) {
+            // 1) Remote: pause+reset (single macro)
+            scope.launch { espController.resetScoreboard() }
+
+            // 2) Local UI reset
             shiftTimerRunning = false
             shiftTimerPhase = ShiftTimerPhase.SHIFT
             shiftTimerRemainingMs = shiftDurationMsSetting
@@ -751,6 +713,7 @@ fun ScoreboardScreen(
             shiftTimerStartRemainingMs = null
         }
     }
+
 
 // Авто-остановка таймера при завершении игры
     LaunchedEffect(gameFinished) {
@@ -830,6 +793,10 @@ fun ScoreboardScreen(
         apiKey = settingsRepository.getApiKey()
         telegramBotToken = (settingsRepository as SettingsRepositoryImpl).getTelegramBotToken()
         telegramBotChatId = (settingsRepository as SettingsRepositoryImpl).getTelegramBotChatId()
+        espHost = (settingsRepository as SettingsRepositoryImpl).getEspHost()
+        espController.setStaticEndpoint(espHost)
+
+
 
         // Длительности таймера (из настроек)
         shiftDurationMsSetting = (settingsRepository as SettingsRepositoryImpl).getShiftDurationMs()
@@ -844,6 +811,8 @@ fun ScoreboardScreen(
         initialApiKey = apiKey
         initialTelegramBotToken = telegramBotToken
         initialTelegramBotChatId = telegramBotChatId
+        initialEspHost = espHost
+
     }
 
 
@@ -1157,6 +1126,8 @@ fun ScoreboardScreen(
             put("currentSeason", currentSeason.trim())
             put("serverUrl", serverUrl.trim())
             put("apiKey", apiKey.trim())
+            put("espHost", espHost.trim())
+
 
             // Telegram-настройки
             put("telegramBotToken", telegramBotToken.trim())
@@ -1176,6 +1147,13 @@ fun ScoreboardScreen(
             (settingsRepository as SettingsRepositoryImpl).setApiKey(apiKey)
             (settingsRepository as SettingsRepositoryImpl).setTelegramBotToken(telegramBotToken)
             (settingsRepository as SettingsRepositoryImpl).setTelegramBotChatId(telegramBotChatId)
+            (settingsRepository as SettingsRepositoryImpl).setEspHost(espHost)
+            espController.setStaticEndpoint(espHost)
+
+// чтобы диалог "изменения" работал корректно и не откатывал ESP IP
+            initialEspHost = espHost
+
+
             val newShiftSec = shiftDurationSecText.toLongOrNull()
             val newBreakSec = breakDurationSecText.toLongOrNull()
 
@@ -1223,6 +1201,10 @@ fun ScoreboardScreen(
         apiKey = initialApiKey
         telegramBotToken = initialTelegramBotToken
         telegramBotChatId = initialTelegramBotChatId
+        espHost = initialEspHost
+        espController.setStaticEndpoint(espHost)
+
+
 
         showSettingsConfirmDialog = false
         showSettingsDialog = false
@@ -2469,7 +2451,7 @@ fun ScoreboardScreen(
                                     ) { Text("Пауза", maxLines = 1) }
 
                                     OutlinedButton(
-                                        onClick = { scope.launch { espController.sendPresses("8", 3) } },
+                                        onClick = { scope.launch { espController.resetScoreboard() } },
                                         modifier = Modifier.weight(1f).height(44.dp)
                                     ) { Text("Сброс", maxLines = 1) }
                                 }
@@ -3124,6 +3106,28 @@ fun ScoreboardScreen(
                     )
 
                     OutlinedTextField(
+                        value = espHost,
+                        onValueChange = { value ->
+                            // IPv4: цифры и точки
+                            espHost = value.filter { ch -> ch.isDigit() || ch == '.' }
+                        },
+                        label = { Text("ESP IP (IPv4)") },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(bottom = 8.dp),
+                        colors = OutlinedTextFieldDefaults.colors(
+                            focusedTextColor = DialogTitleColor,
+                            unfocusedTextColor = DialogTitleColor,
+                            cursorColor = DialogTitleColor,
+                            focusedBorderColor = Color(0xFF546E7A),
+                            unfocusedBorderColor = Color(0xFF455A64)
+                        )
+                    )
+
+
+                    OutlinedTextField(
                         value = telegramBotToken,
                         onValueChange = { telegramBotToken = it },
                         label = { Text("Telegram Bot Token") },
@@ -3243,6 +3247,8 @@ fun ScoreboardScreen(
                                     apiKey != initialApiKey ||
                                     telegramBotToken != initialTelegramBotToken ||
                                     telegramBotChatId != initialTelegramBotChatId
+                                    || espHost != initialEspHost
+
 
                         if (changed) {
                             showSettingsConfirmDialog = true
