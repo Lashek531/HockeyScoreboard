@@ -34,6 +34,7 @@ class EspTabloController(appContext: Context) {
         private const val CMD_MACRO_RESET_SCOREBOARD: Byte = 0x41.toByte()
         private const val CMD_SIREN: Byte = 0x60.toByte()
 
+
         // --- Siren timings (ms) ---
         private const val SIREN_SHORT_BEEP_MS = 300
         private const val SIREN_SHORT_PAUSE_MS = 300
