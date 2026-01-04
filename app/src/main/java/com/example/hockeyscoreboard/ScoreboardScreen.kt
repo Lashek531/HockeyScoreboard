@@ -618,27 +618,20 @@ fun ScoreboardScreen(
     fun sendExternalShiftStartSignals() {
         scope.launch {
             espController.press("-")            // START
+            espController.sirenGameStart()
         }
     }
 
     fun sendSirenShiftStart() {
         scope.launch {
-            espController.sendSiren(
-                onMs = SIREN_SHIFT_START_ON_MS.firstOrNull() ?: 0,
-                offMs = SIREN_SHIFT_START_OFF_MS.firstOrNull() ?: 0
-            )
+            espController.sirenPause()
         }
     }
 
 
 
     fun sendSirenShiftEnd() {
-        scope.launch {
-            espController.sendSiren(
-                onMs = SIREN_SHIFT_END_ON_MS.firstOrNull() ?: 0,
-                offMs = SIREN_SHIFT_END_OFF_MS.firstOrNull() ?: 0
-            )
-        }
+        scope.launch { espController.sirenShiftEndLong() }
     }
 
 
@@ -665,11 +658,16 @@ fun ScoreboardScreen(
                     scope.launch { espController.press("-") }
                 }
             } else {
-                // Перерыв не синхронизируем с табло
-                shiftTimerPlannedStartElapsedMs = null
-                shiftTimerStartRemainingMs = null
-                shiftTimerEndElapsedMs = now + shiftTimerRemainingMs
+                // Перерыв: при Start тоже отправляем START на табло (как в начале), без сирены (C делаем позже)
+                val plannedStart = now + EXTERNAL_START_DELAY_MS
+                shiftTimerPlannedStartElapsedMs = plannedStart
+                shiftTimerStartRemainingMs = shiftTimerRemainingMs
+                shiftTimerEndElapsedMs = plannedStart + shiftTimerRemainingMs
+
+                scope.launch { espController.press("-") }
             }
+
+
         }
     }
 

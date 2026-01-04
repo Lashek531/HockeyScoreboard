@@ -34,6 +34,15 @@ class EspTabloController(appContext: Context) {
         private const val CMD_MACRO_RESET_SCOREBOARD: Byte = 0x41.toByte()
         private const val CMD_SIREN: Byte = 0x60.toByte()
 
+        // --- Siren timings (ms) ---
+        private const val SIREN_SHORT_BEEP_MS = 300
+        private const val SIREN_SHORT_PAUSE_MS = 300
+        private const val SIREN_LONG_BEEP_MS = 1000
+
+        private const val SIREN_START_BEEP_COUNT = 2   // старт игры
+        private const val SIREN_PAUSE_BEEP_COUNT = 3   // пауза
+
+
         private const val ACK_LEN = 7
 
         private const val RETRIES = 3
@@ -123,16 +132,69 @@ class EspTabloController(appContext: Context) {
     suspend fun resetScoreboard(): Boolean =
         sendCommand(CMD_MACRO_RESET_SCOREBOARD, payload = null)
 
-    suspend fun sendSiren(onMs: Int, offMs: Int): Boolean {
-        val on = onMs.coerceIn(0, 60000)
-        val off = offMs.coerceIn(0, 60000)
-        val payload = byteArrayOf(
-            0x01,
-            (on and 0xFF).toByte(), ((on ushr 8) and 0xFF).toByte(),
-            (off and 0xFF).toByte(), ((off ushr 8) and 0xFF).toByte()
-        )
+    /**
+     * Сирена:
+     * CMD=0x60, payload: COUNT(1) + (on16LE, off16LE)*COUNT
+     * Ограничение в прошивке: COUNT 1..3.
+     */
+    suspend fun sendSirenPattern(pattern: List<Pair<Int, Int>>): Boolean {
+        val count = pattern.size
+        if (count !in 1..3) {
+            logLine("SIREN ignored: bad count=$count (allowed 1..3)")
+            return false
+        }
+
+        val payload = ByteArray(1 + count * 4)
+        payload[0] = count.toByte()
+
+        var pos = 1
+        for ((onMs, offMs) in pattern) {
+            val on = onMs.coerceIn(0, 60000)
+            val off = offMs.coerceIn(0, 60000)
+
+            payload[pos++] = (on and 0xFF).toByte()
+            payload[pos++] = ((on ushr 8) and 0xFF).toByte()
+            payload[pos++] = (off and 0xFF).toByte()
+            payload[pos++] = ((off ushr 8) and 0xFF).toByte()
+        }
+
         return sendCommand(CMD_SIREN, payload)
     }
+
+
+
+    // --- Siren presets (no numbers in UI code) ---
+    suspend fun sirenGameStart(): Boolean {
+        // 2 коротких: 300/300 + 300/0
+        return sendSirenPattern(
+            listOf(
+                SIREN_SHORT_BEEP_MS to SIREN_SHORT_PAUSE_MS,
+                SIREN_SHORT_BEEP_MS to 0
+            )
+        )
+    }
+
+    suspend fun sirenPause(): Boolean {
+        // 3 коротких: 300/300 + 300/300 + 300/0
+        return sendSirenPattern(
+            listOf(
+                SIREN_SHORT_BEEP_MS to SIREN_SHORT_PAUSE_MS,
+                SIREN_SHORT_BEEP_MS to SIREN_SHORT_PAUSE_MS,
+                SIREN_SHORT_BEEP_MS to 0
+            )
+        )
+    }
+
+    suspend fun sirenShiftEndLong(): Boolean {
+        // 1 длинный: 1000/0
+        return sendSirenPattern(listOf(SIREN_LONG_BEEP_MS to 0))
+    }
+
+
+    suspend fun sendSiren(onMs: Int, offMs: Int): Boolean {
+        return sendSirenPattern(listOf(onMs to offMs))
+    }
+
 
     private suspend fun sendCommand(cmd: Byte, payload: ByteArray?): Boolean = withContext(Dispatchers.IO) {
         val ep = synchronized(endpointLock) { endpoint }
@@ -152,6 +214,7 @@ class EspTabloController(appContext: Context) {
                 val ok = trySendOnce(ep, pkt, id)
                 if (ok) {
                     _status.value = "ESP: ok (${ep.hostString})"
+
                     return@withContext true
                 }
                 logLine("RETRY ${(attempt + 1)}/$RETRIES cmd=0x${"%02X".format(cmd)} id=$id")
@@ -188,7 +251,9 @@ class EspTabloController(appContext: Context) {
 
                 val status = buf[5].toInt() and 0xFF
                 logLine("ACK id=$ackId status=$status")
-                return status == 0
+// ESP: status=1 accepted, status=0 rejected
+                return status == 1
+
             }
         }
         return false
