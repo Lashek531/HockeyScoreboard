@@ -209,10 +209,12 @@ class EspTabloController(appContext: Context) {
             val id = nextIdU16()
             val pkt = buildPacket(cmd, id, payload)
             val payloadLen = payload?.size ?: 0
-            logLine("SEND cmd=0x${"%02X".format(cmd)} id=$id len=$payloadLen to ${ep.hostString}:${ep.port}")
+            val cmdHex = "0x${"%02X".format(cmd)}"
+            logLine("SEND cmd=$cmdHex id=$id len=$payloadLen to ${ep.hostString}:${ep.port}")
 
             repeat(RETRIES) { attempt ->
-                val ok = trySendOnce(ep, pkt, id)
+                val ok = trySendOnce(ep, pkt, id, cmdHex, attempt + 1)
+
                 if (ok) {
                     _status.value = "ESP: ok (${ep.hostString})"
 
@@ -227,10 +229,20 @@ class EspTabloController(appContext: Context) {
         }
     }
 
-    private fun trySendOnce(ep: InetSocketAddress, pkt: ByteArray, id: Int): Boolean {
+    private fun trySendOnce(
+        ep: InetSocketAddress,
+        pkt: ByteArray,
+        id: Int,
+        cmdHex: String,
+        attemptNo: Int
+    ): Boolean {
         DatagramSocket().use { sock ->
             sock.soTimeout = ACK_TIMEOUT_MS
             val dp = DatagramPacket(pkt, pkt.size, ep.address ?: InetAddress.getByName(ep.hostString), ep.port)
+
+            // логируем каждую попытку отправки
+            logLine("SEND attempt=$attemptNo cmd=$cmdHex id=$id to ${ep.hostString}:${ep.port}")
+            val sentAt = System.currentTimeMillis()
             sock.send(dp)
 
             val buf = ByteArray(ACK_LEN)
@@ -251,14 +263,15 @@ class EspTabloController(appContext: Context) {
                 if (ackId != id) continue
 
                 val status = buf[5].toInt() and 0xFF
-                logLine("ACK id=$ackId status=$status")
-// ESP: status=1 accepted, status=0 rejected
-                return status == 1
+                val rttMs = System.currentTimeMillis() - sentAt
+                logLine("ACK attempt=$attemptNo cmd=$cmdHex id=$ackId status=$status rtt=${rttMs}ms")
 
+                return status == 1  // оставляем как у вас сейчас (раз работает)
             }
         }
         return false
     }
+
 
     private fun buildPacket(cmd: Byte, idU16: Int, payload: ByteArray?): ByteArray {
         val p = payload ?: ByteArray(0)

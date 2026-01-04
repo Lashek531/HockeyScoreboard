@@ -399,6 +399,9 @@ fun ScoreboardScreen(
     var initialTelegramBotToken by remember { mutableStateOf("") }
     var initialTelegramBotChatId by remember { mutableStateOf("") }
     var initialEspHost by remember { mutableStateOf("") }
+    var initialShiftDurationMsSetting by remember { mutableStateOf(DEFAULT_SHIFT_DURATION_MS) }
+    var initialBreakDurationMsSetting by remember { mutableStateOf(DEFAULT_BREAK_DURATION_MS) }
+
 
 
     // Диалог подтверждения изменения настроек
@@ -622,17 +625,7 @@ fun ScoreboardScreen(
         }
     }
 
-    fun sendSirenShiftStart() {
-        scope.launch {
-            espController.sirenPause()
-        }
-    }
 
-
-
-    fun sendSirenShiftEnd() {
-        scope.launch { espController.sirenShiftEndLong() }
-    }
 
 
 
@@ -649,14 +642,17 @@ fun ScoreboardScreen(
                 shiftTimerStartRemainingMs = shiftTimerRemainingMs
                 shiftTimerEndElapsedMs = plannedStart + shiftTimerRemainingMs
 
-                // “Старт смены с нуля” — STOP -> RESET -> START + сирена
+// Старт смены с нуля — START + сирена (внутри sendExternalShiftStartSignals)
                 if (shiftTimerRemainingMs == shiftDurationMsSetting) {
                     sendExternalShiftStartSignals()
-                    sendSirenShiftStart()
                 } else {
-                    // Resume во время смены — просто START
-                    scope.launch { espController.press("-") }
+                    // Resume во время смены — START + сирена старта игры
+                    scope.launch {
+                        espController.press("-")
+                        espController.sirenGameStart()
+                    }
                 }
+
             } else {
                 // Перерыв: при Start тоже отправляем START на табло (как в начале), без сирены (C делаем позже)
                 val plannedStart = now + EXTERNAL_START_DELAY_MS
@@ -664,7 +660,11 @@ fun ScoreboardScreen(
                 shiftTimerStartRemainingMs = shiftTimerRemainingMs
                 shiftTimerEndElapsedMs = plannedStart + shiftTimerRemainingMs
 
-                scope.launch { espController.press("-") }
+                scope.launch {
+                    espController.press("-")
+                    espController.sirenGameStart()
+                }
+
             }
 
 
@@ -692,17 +692,29 @@ fun ScoreboardScreen(
             shiftTimerPlannedStartElapsedMs = null
             shiftTimerStartRemainingMs = null
 
-            scope.launch { espController.press("9") } // STOP
+            scope.launch {
+                espController.press("9")      // PAUSE
+                espController.sirenPause()    // 3 коротких 300/300 (пресет в контроллере)
+            }
+
         }
     }
 
 
     val onShiftTimerReset: () -> Unit = {
         if (!gameFinished) {
-            // 1) Remote: pause+reset (single macro)
-            scope.launch { espController.resetScoreboard() }
 
-            // 2) Local UI reset
+            val wasRunning = shiftTimerRunning
+
+            scope.launch {
+                // Reset во время работающего таймера: 3 коротких (пауза)
+                if (wasRunning) {
+                    espController.sirenPause()
+                }
+                espController.resetScoreboard()
+            }
+
+            // Local UI reset
             shiftTimerRunning = false
             shiftTimerPhase = ShiftTimerPhase.SHIFT
             shiftTimerRemainingMs = shiftDurationMsSetting
@@ -711,6 +723,7 @@ fun ScoreboardScreen(
             shiftTimerStartRemainingMs = null
         }
     }
+
 
 
 // Авто-остановка таймера при завершении игры
@@ -757,7 +770,8 @@ fun ScoreboardScreen(
 
                     if (shiftTimerPhase == ShiftTimerPhase.SHIFT) {
                         // Конец смены -> перерыв (локально)
-                        sendSirenShiftEnd()
+                        scope.launch { espController.sirenShiftEndLong() }
+
                         shiftTimerPhase = ShiftTimerPhase.BREAK
 
                         shiftTimerPlannedStartElapsedMs = null
@@ -777,7 +791,8 @@ fun ScoreboardScreen(
                         shiftTimerEndElapsedMs = plannedStart + shiftDurationMsSetting
 
                         sendExternalShiftStartSignals()
-                        sendSirenShiftStart()
+                        scope.launch { espController.sirenGameStart() }
+
                     }
                 }
 
@@ -810,6 +825,9 @@ fun ScoreboardScreen(
         initialTelegramBotToken = telegramBotToken
         initialTelegramBotChatId = telegramBotChatId
         initialEspHost = espHost
+        initialShiftDurationMsSetting = shiftDurationMsSetting
+        initialBreakDurationMsSetting = breakDurationMsSetting
+
 
     }
 
@@ -1164,6 +1182,11 @@ fun ScoreboardScreen(
                 breakDurationMsSetting = newBreakSec * 1000L
                 (settingsRepository as SettingsRepositoryImpl).setBreakDurationMs(breakDurationMsSetting)
             }
+            initialShiftDurationMsSetting = shiftDurationMsSetting
+            initialBreakDurationMsSetting = breakDurationMsSetting
+            shiftDurationSecText = (shiftDurationMsSetting / 1000L).toString()
+            breakDurationSecText = (breakDurationMsSetting / 1000L).toString()
+
 
             // 2. Формируем JSON настроек
             val json = buildAppSettingsJson()
@@ -1201,6 +1224,11 @@ fun ScoreboardScreen(
         telegramBotChatId = initialTelegramBotChatId
         espHost = initialEspHost
         espController.setStaticEndpoint(espHost)
+        shiftDurationMsSetting = initialShiftDurationMsSetting
+        breakDurationMsSetting = initialBreakDurationMsSetting
+        shiftDurationSecText = (shiftDurationMsSetting / 1000L).toString()
+        breakDurationSecText = (breakDurationMsSetting / 1000L).toString()
+
 
 
 
@@ -3241,13 +3269,22 @@ fun ScoreboardScreen(
             confirmButton = {
                 TextButton(
                     onClick = {
+                        val newShiftSec = shiftDurationSecText.toLongOrNull()
+                        val newBreakSec = breakDurationSecText.toLongOrNull()
+
+                        val newShiftMs = if (newShiftSec != null && newShiftSec > 0L) newShiftSec * 1000L else shiftDurationMsSetting
+                        val newBreakMs = if (newBreakSec != null && newBreakSec > 0L) newBreakSec * 1000L else breakDurationMsSetting
+
                         val changed =
                             currentSeason != initialSeason ||
                                     serverUrl != initialServerUrl ||
                                     apiKey != initialApiKey ||
                                     telegramBotToken != initialTelegramBotToken ||
-                                    telegramBotChatId != initialTelegramBotChatId
-                                    || espHost != initialEspHost
+                                    telegramBotChatId != initialTelegramBotChatId ||
+                                    espHost != initialEspHost ||
+                                    newShiftMs != initialShiftDurationMsSetting ||
+                                    newBreakMs != initialBreakDurationMsSetting
+
 
 
                         if (changed) {
