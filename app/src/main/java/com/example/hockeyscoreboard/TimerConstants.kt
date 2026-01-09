@@ -4,7 +4,7 @@ package com.example.hockeyscoreboard
 const val TIMER_TICK_MS: Long = 100L
 
 // Компенсация задержки внешнего табло (подбирается экспериментально)
-const val EXTERNAL_START_DELAY_MS: Long = 800L
+const val EXTERNAL_START_DELAY_MS: Long = 300L
 
 // Значения по умолчанию для настроек длительности
 const val DEFAULT_SHIFT_DURATION_MS: Long = 2L * 60L * 1000L
