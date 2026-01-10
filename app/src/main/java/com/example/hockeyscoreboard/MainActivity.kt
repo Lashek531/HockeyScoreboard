@@ -22,6 +22,9 @@ import java.io.File
 import java.net.HttpURLConnection
 import java.net.URL
 import kotlin.text.Charsets
+import com.example.hockeyscoreboard.HttpOutboxRepository
+import com.example.hockeyscoreboard.HttpRetryScheduler
+
 
 class MainActivity : ComponentActivity() {
 
@@ -42,7 +45,6 @@ class MainActivity : ComponentActivity() {
                 Surface(modifier = Modifier.fillMaxSize()) {
                     ScoreboardScreen(
 
-                        // Когда игра завершена — отправляем finished JSON на Raspi
                         onGameSaved = { file ->
                             lifecycleScope.launch(Dispatchers.IO) {
                                 val json = runCatching {
@@ -58,18 +60,37 @@ class MainActivity : ComponentActivity() {
                                     return@launch
                                 }
 
+                                // season берём из имени папки (как есть сейчас)
+                                val season = file.parentFile?.name.orEmpty()
+                                val gameId = file.nameWithoutExtension
+
+                                // 1) кладём в http-outbox (PENDING)
+                                val httpOutbox = HttpOutboxRepository(this@MainActivity)
+                                httpOutbox.upsertPending(
+                                    gameId = gameId,
+                                    season = season,
+                                    finishedFilePath = file.absolutePath
+                                )
+
+                                // 2) прямая попытка отправки
                                 val res = raspiRepo.uploadFinishedGame(json)
-                                if (!res.success) {
+                                if (res.success) {
+                                    httpOutbox.markSent(gameId, season)
+                                } else {
+                                    httpOutbox.markFailed(gameId, season, res.errorMessage ?: "HTTP upload failed")
+                                    HttpRetryScheduler.schedule(this@MainActivity)
+
                                     withContext(Dispatchers.Main) {
                                         Toast.makeText(
                                             this@MainActivity,
-                                            "Ошибка отправки завершённой игры на сервер",
+                                            "Поставлено в очередь (сервер)",
                                             Toast.LENGTH_LONG
                                         ).show()
                                     }
                                 }
                             }
                         },
+
 
                         // Обновление active_game.json на сервере
                         onGameJsonUpdated = { file ->

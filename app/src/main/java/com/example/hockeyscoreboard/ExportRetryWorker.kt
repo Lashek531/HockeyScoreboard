@@ -39,10 +39,14 @@ class ExportRetryWorker(
         }
 
         for (item in items) {
-            // Лимит попыток: чтобы не долбить бесконечно
+// Лимит попыток: чтобы не долбить бесконечно
             if (item.attempts >= MAX_ATTEMPTS) continue
 
+// Защита от дублей: если уже отправляется/отправлено — пропускаем
+            if (!outboxRepo.tryMarkSending(item.gameId)) continue
+
             val exportFile = resolveExportFile(item.exportFileName)
+
 
             // Если файл пропал — восстанавливаем из archived finished JSON
             val ensuredFile: File = if (exportFile.exists()) {

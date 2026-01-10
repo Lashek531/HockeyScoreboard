@@ -4326,8 +4326,10 @@ fun ScoreboardScreen(
                             ExportOutboxStatus.SENT -> "Экспорт: отправлено"
                             ExportOutboxStatus.FAILED -> "Экспорт: ошибка (попыток: ${outboxItem.attempts})"
                             ExportOutboxStatus.PENDING -> "Экспорт: ожидает отправки"
+                            ExportOutboxStatus.SENDING -> "Экспорт: отправляется"
                             null -> "Экспорт: нет данных"
                         },
+
                         fontSize = 14.sp,
                         color = DialogTextColor
                     )
@@ -4487,23 +4489,30 @@ fun ScoreboardScreen(
                                         eventId = generated.eventId,
                                         exportFileName = generated.exportFile.name
                                     )
-
-                                    // 3) Отправляем документ в Telegram
-                                    val res = TelegramDocumentSender.sendDocument(
-                                        token = token,
-                                        chatId = chatId,
-                                        file = generated.exportFile,
-                                        contentType = "application/json"
-                                    )
-
-                                    if (res.isSuccess) {
-                                        outboxRepo.markSent(entry.gameId)
+// 3) Защита от дублей: если уже отправляется/отправлено — не шлём повторно
+                                    val claimed = outboxRepo.tryMarkSending(entry.gameId)
+                                    if (!claimed) {
+                                        // Уже в процессе отправки (Worker или другой ручной запуск) / либо уже SENT
                                         Triple(true, null, false)
                                     } else {
-                                        val err = res.exceptionOrNull()?.message ?: "Ошибка отправки"
-                                        outboxRepo.markFailed(entry.gameId, err)
-                                        Triple(false, err, true)
+                                        // 4) Отправляем документ в Telegram
+                                        val res = TelegramDocumentSender.sendDocument(
+                                            token = token,
+                                            chatId = chatId,
+                                            file = generated.exportFile,
+                                            contentType = "application/json"
+                                        )
+
+                                        if (res.isSuccess) {
+                                            outboxRepo.markSent(entry.gameId)
+                                            Triple(true, null, false)
+                                        } else {
+                                            val err = res.exceptionOrNull()?.message ?: "Ошибка отправки"
+                                            outboxRepo.markFailed(entry.gameId, err)
+                                            Triple(false, err, true)
+                                        }
                                     }
+
                                 }.getOrElse { e ->
                                     val err = e.message ?: "Ошибка отправки"
                                     outboxRepo.markFailed(entry.gameId, err)
@@ -4520,11 +4529,12 @@ fun ScoreboardScreen(
                             if (success) {
                                 Toast.makeText(context, "Отправлено", Toast.LENGTH_LONG).show()
                             } else {
-                                Toast.makeText(context, "Не отправлено: ${err ?: "Ошибка отправки"}", Toast.LENGTH_LONG).show()
+                                Toast.makeText(context, "Поставлено в очередь", Toast.LENGTH_LONG).show()
                                 if (needRetry) {
                                     ExportRetryScheduler.schedule(context)
                                 }
                             }
+
 
                             showManualExportSendDialog = false
                         }

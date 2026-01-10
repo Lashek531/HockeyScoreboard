@@ -7,20 +7,19 @@ import java.io.File
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
-enum class ExportOutboxStatus { PENDING, SENT, FAILED, SENDING }
+enum class HttpOutboxStatus { PENDING, SENT, FAILED, SENDING }
 
-data class ExportOutboxItem(
+data class HttpOutboxItem(
     val gameId: String,
     val season: String,
-    val eventId: Int,
-    val exportFileName: String, // например: result_11.json
-    val status: ExportOutboxStatus,
+    val finishedFilePath: String,
+    val status: HttpOutboxStatus,
     val attempts: Int,
     val lastError: String?,
     val updatedAt: Long
 )
 
-class ExportOutboxRepository(private val context: Context) {
+class HttpOutboxRepository(private val context: Context) {
 
     private val lock = ReentrantLock()
 
@@ -31,42 +30,26 @@ class ExportOutboxRepository(private val context: Context) {
         File(getDbRoot(), "hockey-json/outbox").apply { if (!exists()) mkdirs() }
 
     private fun outboxFile(): File =
-        File(outboxDir(), "outbox.json")
+        File(outboxDir(), "http_outbox.json")
 
-    fun getAll(): List<ExportOutboxItem> = lock.withLock {
-        readState().items
-    }
+    fun getAll(): List<HttpOutboxItem> = lock.withLock { readState().items }
 
-    fun getByGameId(gameId: String): ExportOutboxItem? = lock.withLock {
-        readState().items.firstOrNull { it.gameId == gameId }
-    }
-
-    /**
-     * Upsert по ключу gameId. "Последний победил":
-     * - если игра уже была в outbox, запись заменяется
-     */
-    fun upsertPending(
-        gameId: String,
-        season: String,
-        eventId: Int,
-        exportFileName: String
-    ): ExportOutboxItem = lock.withLock {
+    fun upsertPending(gameId: String, season: String, finishedFilePath: String): HttpOutboxItem = lock.withLock {
         val state = readState()
         val now = System.currentTimeMillis()
 
-        val newItem = ExportOutboxItem(
+        val newItem = HttpOutboxItem(
             gameId = gameId,
             season = season,
-            eventId = eventId,
-            exportFileName = exportFileName,
-            status = ExportOutboxStatus.PENDING,
+            finishedFilePath = finishedFilePath,
+            status = HttpOutboxStatus.PENDING,
             attempts = 0,
             lastError = null,
             updatedAt = now
         )
 
         val newItems = state.items
-            .filterNot { it.gameId == gameId }
+            .filterNot { it.gameId == gameId && it.season == season }
             .toMutableList()
             .apply { add(newItem) }
 
@@ -74,44 +57,33 @@ class ExportOutboxRepository(private val context: Context) {
         newItem
     }
 
-    /**
-     * Защита от дублей: "захват" отправки.
-     * Возвращает true, если удалось перевести запись в SENDING.
-     * Если запись уже SENT или уже SENDING — вернёт false.
-     */
-    fun tryMarkSending(gameId: String): Boolean = lock.withLock {
+    fun tryMarkSending(gameId: String, season: String): Boolean = lock.withLock {
         val state = readState()
-        val idx = state.items.indexOfFirst { it.gameId == gameId }
+        val idx = state.items.indexOfFirst { it.gameId == gameId && it.season == season }
         if (idx < 0) return@withLock false
 
         val item = state.items[idx]
-        if (item.status == ExportOutboxStatus.SENT || item.status == ExportOutboxStatus.SENDING) {
+        if (item.status == HttpOutboxStatus.SENT || item.status == HttpOutboxStatus.SENDING) {
             return@withLock false
         }
 
         val newItems = state.items.toMutableList()
         newItems[idx] = item.copy(
-            status = ExportOutboxStatus.SENDING,
+            status = HttpOutboxStatus.SENDING,
             updatedAt = System.currentTimeMillis()
         )
         writeState(newItems)
         true
     }
 
-    fun markSent(gameId: String) = lock.withLock {
-        update(gameId) {
-            it.copy(
-                status = ExportOutboxStatus.SENT,
-                updatedAt = System.currentTimeMillis(),
-                lastError = null
-            )
-        }
+    fun markSent(gameId: String, season: String) = lock.withLock {
+        update(gameId, season) { it.copy(status = HttpOutboxStatus.SENT, updatedAt = System.currentTimeMillis(), lastError = null) }
     }
 
-    fun markFailed(gameId: String, error: String) = lock.withLock {
-        update(gameId) {
+    fun markFailed(gameId: String, season: String, error: String) = lock.withLock {
+        update(gameId, season) {
             it.copy(
-                status = ExportOutboxStatus.FAILED,
+                status = HttpOutboxStatus.FAILED,
                 attempts = it.attempts + 1,
                 lastError = error,
                 updatedAt = System.currentTimeMillis()
@@ -119,9 +91,13 @@ class ExportOutboxRepository(private val context: Context) {
         }
     }
 
-    private fun update(gameId: String, transform: (ExportOutboxItem) -> ExportOutboxItem) {
+    private fun update(
+        gameId: String,
+        season: String,
+        transform: (HttpOutboxItem) -> HttpOutboxItem
+    ) {
         val state = readState()
-        val idx = state.items.indexOfFirst { it.gameId == gameId }
+        val idx = state.items.indexOfFirst { it.gameId == gameId && it.season == season }
         if (idx < 0) return
 
         val newItems = state.items.toMutableList()
@@ -129,7 +105,7 @@ class ExportOutboxRepository(private val context: Context) {
         writeState(newItems)
     }
 
-    private data class State(val version: Int, val items: List<ExportOutboxItem>)
+    private data class State(val version: Int, val items: List<HttpOutboxItem>)
 
     private fun readState(): State {
         val f = outboxFile()
@@ -146,16 +122,15 @@ class ExportOutboxRepository(private val context: Context) {
             for (i in 0 until arr.length()) {
                 val obj = arr.optJSONObject(i) ?: continue
 
-                val statusStr = obj.optString("status", ExportOutboxStatus.PENDING.name)
-                val status = runCatching { ExportOutboxStatus.valueOf(statusStr) }
-                    .getOrElse { ExportOutboxStatus.PENDING }
+                val statusStr = obj.optString("status", HttpOutboxStatus.PENDING.name)
+                val status = runCatching { HttpOutboxStatus.valueOf(statusStr) }
+                    .getOrElse { HttpOutboxStatus.PENDING }
 
                 add(
-                    ExportOutboxItem(
+                    HttpOutboxItem(
                         gameId = obj.optString("gameId", ""),
                         season = obj.optString("season", ""),
-                        eventId = obj.optInt("eventId", 0),
-                        exportFileName = obj.optString("exportFileName", ""),
+                        finishedFilePath = obj.optString("finishedFilePath", ""),
                         status = status,
                         attempts = obj.optInt("attempts", 0),
                         lastError = obj.optString("lastError", null),
@@ -163,12 +138,12 @@ class ExportOutboxRepository(private val context: Context) {
                     )
                 )
             }
-        }.filter { it.gameId.isNotBlank() && it.season.isNotBlank() && it.exportFileName.isNotBlank() }
+        }.filter { it.gameId.isNotBlank() && it.season.isNotBlank() && it.finishedFilePath.isNotBlank() }
 
         return State(version = version, items = items)
     }
 
-    private fun writeState(items: List<ExportOutboxItem>) {
+    private fun writeState(items: List<HttpOutboxItem>) {
         val root = JSONObject()
         root.put("version", 1)
 
@@ -177,8 +152,7 @@ class ExportOutboxRepository(private val context: Context) {
             val obj = JSONObject()
             obj.put("gameId", it.gameId)
             obj.put("season", it.season)
-            obj.put("eventId", it.eventId)
-            obj.put("exportFileName", it.exportFileName)
+            obj.put("finishedFilePath", it.finishedFilePath)
             obj.put("status", it.status.name)
             obj.put("attempts", it.attempts)
             obj.put("lastError", it.lastError)

@@ -9,16 +9,16 @@ import androidx.work.OneTimeWorkRequestBuilder
 import androidx.work.WorkManager
 import java.util.concurrent.TimeUnit
 
-object ExportRetryScheduler {
+object HttpRetryScheduler {
 
-    private const val UNIQUE_WORK_NAME = "export_retry"
+    private const val UNIQUE_WORK_NAME = "http_retry"
 
     fun schedule(context: Context) {
         val constraints = Constraints.Builder()
             .setRequiredNetworkType(NetworkType.CONNECTED)
             .build()
 
-        val request = OneTimeWorkRequestBuilder<ExportRetryWorker>()
+        val request = OneTimeWorkRequestBuilder<HttpRetryWorker>()
             .setConstraints(constraints)
             .setBackoffCriteria(
                 BackoffPolicy.EXPONENTIAL,

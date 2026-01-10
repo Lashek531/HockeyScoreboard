@@ -18,6 +18,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicInteger
+import java.io.IOException
 
 class EspTabloController(appContext: Context) {
 
@@ -240,10 +241,18 @@ class EspTabloController(appContext: Context) {
             sock.soTimeout = ACK_TIMEOUT_MS
             val dp = DatagramPacket(pkt, pkt.size, ep.address ?: InetAddress.getByName(ep.hostString), ep.port)
 
-            // логируем каждую попытку отправки
+// логируем каждую попытку отправки
             logLine("SEND attempt=$attemptNo cmd=$cmdHex id=$id to ${ep.hostString}:${ep.port}")
             val sentAt = System.currentTimeMillis()
-            sock.send(dp)
+
+            try {
+                sock.send(dp)
+            } catch (e: IOException) {
+                // ENETUNREACH и прочие сетевые ошибки: не падаем, считаем попытку неуспешной
+                logLine("SEND failed attempt=$attemptNo cmd=$cmdHex id=$id: ${e.message}")
+                return false
+            }
+
 
             val buf = ByteArray(ACK_LEN)
             val rcv = DatagramPacket(buf, buf.size)
@@ -254,7 +263,12 @@ class EspTabloController(appContext: Context) {
                     sock.receive(rcv)
                 } catch (_: SocketTimeoutException) {
                     return false
+                } catch (e: IOException) {
+                    // На некоторых состояниях сети receive тоже может упасть — не валим приложение
+                    logLine("RECV failed attempt=$attemptNo cmd=$cmdHex id=$id: ${e.message}")
+                    return false
                 }
+
 
                 if (rcv.length != ACK_LEN) continue
                 if (buf[0] != MAGIC || buf[1] != VERSION || buf[2] != CMD_ACK) continue
