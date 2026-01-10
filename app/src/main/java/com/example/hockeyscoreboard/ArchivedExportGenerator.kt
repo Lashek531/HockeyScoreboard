@@ -4,7 +4,13 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Calendar
+import java.util.Date
+import java.util.Locale
 import com.example.hockeyscoreboard.model.PlayerInfo
+
+
 
 
 data class GeneratedExport(
@@ -34,9 +40,37 @@ object ArchivedExportGenerator {
 
         val finishedJson = JSONObject(finishedGameFile.readText(Charsets.UTF_8))
 
-        val eventId = eventIdOverride
-            ?: finishedJson.optString("externalEventId").toIntOrNull()
-            ?: 0
+        val eventId = run {
+            val overrideId = eventIdOverride?.takeIf { it > 0 }
+
+            val externalId = finishedJson
+                .optString("externalEventId")
+                .toIntOrNull()
+                ?.takeIf { it > 0 }
+
+            if (overrideId != null) return@run overrideId
+            if (externalId != null) return@run externalId
+
+            // Fallback: генерируем компактный ID YYDDDHHMM (вариант A).
+            // Берём дату из finishedJson["date"], а если не парсится — используем текущее время,
+            // чтобы гарантированно не получить 0.
+            val dateStr = finishedJson.optString("date")
+            val dt = try {
+                SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.getDefault()).parse(dateStr)
+            } catch (_: Exception) {
+                null
+            } ?: Date()
+
+            val cal = Calendar.getInstance().apply { time = dt }
+            val yy = cal.get(Calendar.YEAR) % 100
+            val ddd = cal.get(Calendar.DAY_OF_YEAR)
+            val hh = cal.get(Calendar.HOUR_OF_DAY)
+            val mm = cal.get(Calendar.MINUTE)
+
+            yy * 10_000_000 + ddd * 10_000 + hh * 100 + mm
+        }
+
+
 
         val teams = finishedJson.getJSONObject("teams")
         val goalsArray = finishedJson.optJSONArray("goals") ?: JSONArray()

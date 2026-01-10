@@ -1466,9 +1466,19 @@ fun ScoreboardScreen(
             goalsArray.put(o)
         }
 
-        // --- event_id должен быть INT (или 0 при ошибке) ---
         val eventIdStr = externalEventId?.takeIf { it.isNotBlank() } ?: gameId
-        val eventIdInt = eventIdStr.toIntOrNull() ?: 0
+        val eventIdInt = (eventIdStr.toIntOrNull() ?: 0).let { parsed ->
+            if (parsed > 0) parsed else run {
+                // Fallback (вариант A): YYDDDHHMM — берём время старта игры (start уже используется выше для minute)
+                val cal = java.util.Calendar.getInstance().apply { timeInMillis = start }
+                val yy = cal.get(java.util.Calendar.YEAR) % 100
+                val ddd = cal.get(java.util.Calendar.DAY_OF_YEAR)
+                val hh = cal.get(java.util.Calendar.HOUR_OF_DAY)
+                val mm = cal.get(java.util.Calendar.MINUTE)
+                yy * 10_000_000 + ddd * 10_000 + hh * 100 + mm
+            }
+        }
+
 
         // --- Итоговый JSON ---
         val root = org.json.JSONObject().apply {
