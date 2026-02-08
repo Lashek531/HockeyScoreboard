@@ -66,11 +66,16 @@ class MainActivity : ComponentActivity() {
 
                                 // 1) кладём в http-outbox (PENDING)
                                 val httpOutbox = HttpOutboxRepository(this@MainActivity)
-                                httpOutbox.upsertPending(
-                                    gameId = gameId,
-                                    season = season,
-                                    finishedFilePath = file.absolutePath
-                                )
+                                runCatching {
+                                    httpOutbox.upsertPending(
+                                        gameId = gameId,
+                                        season = season,
+                                        finishedFilePath = file.absolutePath
+                                    )
+                                }.onFailure {
+                                    // Не даём падать процессу из-за очереди; сам upload всё равно пробуем.
+                                }
+
 
                                 // 2) прямая попытка отправки
                                 val res = raspiRepo.uploadFinishedGame(json)
