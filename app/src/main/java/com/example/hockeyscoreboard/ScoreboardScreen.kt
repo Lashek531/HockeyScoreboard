@@ -492,6 +492,8 @@ fun ScoreboardScreen(
     var showNewGameConfirm by remember { mutableStateOf(false) }
     var showActionsMenu by remember { mutableStateOf(false) }
     var showTabloRemoteDialog by remember { mutableStateOf(false) }
+    var showTabloHelpDialog by remember { mutableStateOf(false) }
+
 
     val espController = remember {
         EspTabloController(context.applicationContext)
@@ -617,11 +619,39 @@ fun ScoreboardScreen(
     val shiftTimerPhaseText = if (shiftTimerPhase == ShiftTimerPhase.SHIFT) "Смена" else "Перерыв"
     val shiftTimerText = formatMmSs(shiftTimerRemainingMs)
 
-    // В начале каждой смены: STOP -> RESET -> START (как вы подтвердили)
-    fun sendExternalShiftStartSignals() {
+       fun sendExternalShiftStartSignals() {
         scope.launch {
             espController.press("-")            // START
             espController.sirenGameStart()
+        }
+    }
+    // При изменении длительности смены в настройках: PAUSE -> RESET -> 7 -> MMSS
+    suspend fun sendShiftDurationToTablo(totalSeconds: Long) {
+        val minutes = totalSeconds / 60L
+        val seconds = totalSeconds % 60L
+
+        // Табло принимает 4 цифры MMSS, минуты 00..99
+        if (minutes !in 0L..99L || seconds !in 0L..59L) {
+            Toast.makeText(context, "Неверное время для табло: ${minutes}м ${seconds}с", Toast.LENGTH_LONG).show()
+            return
+        }
+
+        // 1) PAUSE
+        espController.press("9")
+
+        // 2) RESET (строго как вы описали: 8 x3 после паузы)
+        espController.sendPresses("8", 3)
+
+        // 3) Ввод верхнего значения таймера
+        espController.press("7")
+
+        // 4) MMSS четырьмя цифрами
+        val mm = "%02d".format(minutes)
+        val ss = "%02d".format(seconds)
+        val digits = mm + ss
+
+        for (ch in digits) {
+            espController.press(ch.toString())
         }
     }
 
@@ -1170,13 +1200,32 @@ fun ScoreboardScreen(
             initialEspHost = espHost
 
 
+            val oldShiftMs = shiftDurationMsSetting
+
             val newShiftSec = shiftDurationSecText.toLongOrNull()
             val newBreakSec = breakDurationSecText.toLongOrNull()
 
+            var shiftChanged = false
+
             if (newShiftSec != null && newShiftSec > 0L) {
-                shiftDurationMsSetting = newShiftSec * 1000L
-                (settingsRepository as SettingsRepositoryImpl).setShiftDurationMs(shiftDurationMsSetting)
+                val newShiftMs = newShiftSec * 1000L
+                if (newShiftMs != oldShiftMs) {
+                    shiftDurationMsSetting = newShiftMs
+                    (settingsRepository as SettingsRepositoryImpl).setShiftDurationMs(shiftDurationMsSetting)
+                    shiftChanged = true
+                }
             }
+
+            if (newBreakSec != null && newBreakSec > 0L) {
+                breakDurationMsSetting = newBreakSec * 1000L
+                (settingsRepository as SettingsRepositoryImpl).setBreakDurationMs(breakDurationMsSetting)
+            }
+
+// Если длительность смены изменилась — сразу перестраиваем физическое табло
+            if (shiftChanged && espHost.trim().isNotBlank()) {
+                sendShiftDurationToTablo(shiftDurationMsSetting / 1000L)
+            }
+
 
             if (newBreakSec != null && newBreakSec > 0L) {
                 breakDurationMsSetting = newBreakSec * 1000L
@@ -2179,15 +2228,13 @@ fun ScoreboardScreen(
                             )
                         }
 
-                        FloatingActionButton(
+                        ExtendedFloatingActionButton(
                             onClick = { onChangePeriodPressed() },
                             containerColor = MaterialTheme.colorScheme.secondary
                         ) {
-                            Icon(
-                                imageVector = Icons.Filled.Add,
-                                contentDescription = "Смена тайма"
-                            )
+                            Text("Смена сторон")
                         }
+
                     }
 
                     FloatingActionButton(
@@ -2591,6 +2638,13 @@ fun ScoreboardScreen(
                                     ) {
                                         Text("ТАЙМЕР", style = MaterialTheme.typography.titleMedium)
                                     }
+                                    OutlinedButton(
+                                        onClick = { scope.launch { espController.press("ПрТМП2") } },
+                                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                                    ) {
+                                        Text("ПрТМП2", style = MaterialTheme.typography.titleMedium)
+                                    }
+
                                 }
 
                                 // ---------- Правая колонка: numpad (крупнее) ----------
@@ -2635,6 +2689,13 @@ fun ScoreboardScreen(
                                         }
                                         Spacer(Modifier.weight(1f))
                                     }
+                                    OutlinedButton(
+                                        onClick = { showTabloHelpDialog = true },
+                                        modifier = Modifier.fillMaxWidth().height(48.dp)
+                                    ) {
+                                        Text("Помощь", style = MaterialTheme.typography.titleMedium)
+                                    }
+
                                 }
                             }
                         }
@@ -2648,6 +2709,33 @@ fun ScoreboardScreen(
                         style = MaterialTheme.typography.bodyMedium,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
+                    if (showTabloHelpDialog) {
+                        AlertDialog(
+                            onDismissRequest = { showTabloHelpDialog = false },
+                            title = { Text("Помощь") },
+                            text = {
+                                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    Text("Режим работы (меню выбора):")
+                                    Text("• 0 — вход в режим выбора типа работы")
+                                    Text("• 0 — секундомер")
+                                    Text("• 1 — таймер")
+
+                                    Spacer(Modifier.height(8.dp))
+
+                                    Text("Установка пределов:")
+                                    Text("• 7 — установка верхнего предела: после нажатия 7 ввести 4 цифры (####)")
+                                    Text("• ПрТМП2 — установка нижнего предела: после нажатия ПрТМП2 ввести 4 цифры (####)")
+                                }
+                            },
+
+                            confirmButton = {
+                                OutlinedButton(onClick = { showTabloHelpDialog = false }) {
+                                    Text("Закрыть")
+                                }
+                            }
+                        )
+                    }
+
                 }
             },
 

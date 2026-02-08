@@ -3,6 +3,8 @@ package com.example.hockeyscoreboard
 import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
+import org.json.JSONTokener
+
 import java.io.File
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -138,35 +140,68 @@ class ExportOutboxRepository(private val context: Context) {
         val text = f.readText(Charsets.UTF_8).trim()
         if (text.isEmpty()) return State(version = 1, items = emptyList())
 
-        val root = JSONObject(text)
-        val version = root.optInt("version", 1)
-        val arr = root.optJSONArray("items") ?: JSONArray()
+        try {
+            fun parseValue(raw: String): Any? = JSONTokener(raw).nextValue()
 
-        val items = buildList {
-            for (i in 0 until arr.length()) {
-                val obj = arr.optJSONObject(i) ?: continue
+            var value: Any? = parseValue(text)
 
-                val statusStr = obj.optString("status", ExportOutboxStatus.PENDING.name)
-                val status = runCatching { ExportOutboxStatus.valueOf(statusStr) }
-                    .getOrElse { ExportOutboxStatus.PENDING }
-
-                add(
-                    ExportOutboxItem(
-                        gameId = obj.optString("gameId", ""),
-                        season = obj.optString("season", ""),
-                        eventId = obj.optInt("eventId", 0),
-                        exportFileName = obj.optString("exportFileName", ""),
-                        status = status,
-                        attempts = obj.optInt("attempts", 0),
-                        lastError = obj.optString("lastError", null),
-                        updatedAt = obj.optLong("updatedAt", 0L)
-                    )
-                )
+            // Иногда файл может содержать JSON как строку:  "{...}" или "[...]"
+            if (value is String) {
+                val s = value.trim()
+                if ((s.startsWith("{") && s.endsWith("}")) || (s.startsWith("[") && s.endsWith("]"))) {
+                    value = parseValue(s)
+                }
             }
-        }.filter { it.gameId.isNotBlank() && it.season.isNotBlank() && it.exportFileName.isNotBlank() }
 
-        return State(version = version, items = items)
+            val version: Int
+            val arr: JSONArray = when (value) {
+                is JSONObject -> {
+                    version = value.optInt("version", 1)
+                    value.optJSONArray("items") ?: JSONArray()
+                }
+                is JSONArray -> {
+                    // Старый/упрощённый формат: файл = массив items
+                    version = 1
+                    value
+                }
+                else -> {
+                    // Неожиданный тип — считаем как пустое состояние
+                    return State(version = 1, items = emptyList())
+                }
+            }
+
+            val items = buildList {
+                for (i in 0 until arr.length()) {
+                    val obj = arr.optJSONObject(i) ?: continue
+                    add(
+                        ExportOutboxItem(
+                            gameId = obj.optString("gameId", ""),
+                            season = obj.optString("season", ""),
+                            eventId = obj.optInt("eventId", 0),
+                            exportFileName = obj.optString("exportFileName", ""),
+                            status = ExportOutboxStatus.valueOf(
+                                obj.optString("status", ExportOutboxStatus.PENDING.name)
+                            ),
+                            attempts = obj.optInt("attempts", 0),
+                            lastError = obj.optString("lastError", null),
+                            updatedAt = obj.optLong("updatedAt", 0L)
+                        )
+                    )
+                }
+            }.filter { it.gameId.isNotBlank() && it.season.isNotBlank() && it.exportFileName.isNotBlank() }
+
+            return State(version = version, items = items)
+        } catch (e: Exception) {
+            // Файл повреждён/непарсится — чтобы не падать, бэкапнем и начнем заново
+            runCatching {
+                val backup = File(f.parentFile, "outbox.bad.${System.currentTimeMillis()}.json")
+                f.copyTo(backup, overwrite = true)
+                f.delete()
+            }
+            return State(version = 1, items = emptyList())
+        }
     }
+
 
     private fun writeState(items: List<ExportOutboxItem>) {
         val root = JSONObject()
